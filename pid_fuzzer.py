@@ -26,6 +26,10 @@ CreateFileW = kernel32.CreateFileW
 CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD, W.HANDLE]
 CreateFileW.restype  = W.HANDLE
 
+WaitNamedPipeW = kernel32.WaitNamedPipeW
+WaitNamedPipeW.argtypes = [W.LPCWSTR, W.DWORD]
+WaitNamedPipeW.restype  = W.BOOL
+
 WriteFile = kernel32.WriteFile
 WriteFile.argtypes = [W.HANDLE, W.LPCVOID, W.DWORD, C.POINTER(W.DWORD), W.LPVOID]
 WriteFile.restype  = W.BOOL
@@ -709,6 +713,51 @@ class FuzzSkeleton:
 
         raise ValueError(f"unknown surface: {self.surface}")
 
+    # ---- orchestrator for spawned process ----
+    def run(self, seeds: List[bytes], max_iters: int) -> None:
+        if not seeds:
+            print("[fuzz] No seeds provided; nothing to do.")
+            return
+
+        print(f"[fuzz] Skeleton started | target={self.target_path} | surface={self.surface} "
+              f"| iters={max_iters} | seeds={len(seeds)}")
+
+        for si, seed in enumerate(seeds):
+            print(f"[fuzz] seed {si+1}/{len(seeds)} (len={len(seed)})")
+            for it in range(max(1, max_iters)):
+                try:
+                    payload = self._mutate(seed, it)
+                except Exception as e:
+                    print(f"[fuzz] mutation error at iter {it}: {e}")
+                    continue
+
+                try:
+                    rc, stdout, stderr = self._execute(payload)
+                except Exception as e:
+                    # includes subprocess.TimeoutExpired and other spawn errors
+                    print(f"[fuzz] execution error at iter {it}: {e}")
+                    continue
+
+                probable, indicators = self.classifier.classify(rc, stderr)
+                if probable:
+                    print("\n=== PROBABLE BUFFER OVERFLOW (spawned skeleton) ===")
+                    print("Indicators:", ", ".join(indicators))
+                    paths = self.repro.build_and_optionally_run(
+                        target_path=self.target_path,
+                        surface=self.surface,
+                        payload=payload,
+                        timeout=self.timeout,
+                        arg_index=self.arg_index,
+                        env_overrides=self.env_overrides,
+                        file_arg_index=self.file_arg_index,
+                        run_after_write=True
+                    )
+                    print("[fuzz] Repro bundle:", json.dumps(paths, indent=2))
+                    print("[fuzz] Stopping after first overflow (skeleton behavior).")
+                    return
+
+        print("[fuzz] Completed without detecting probable buffer overflows.")
+
 # ---------------- Fuzzing Skeleton for a running PID ----------------
 class FuzzSkeletonPID:
     """
@@ -990,10 +1039,12 @@ class FuzzSkeletonPID:
 
 # ---------------- CLI ----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="IAT snapshot + strict overflow classifier + repro generator + fuzz skeleton (+ PID skeleton)")
+    p = argparse.ArgumentParser(
+        description="IAT snapshot + strict overflow classifier + repro generator + fuzz skeleton (+ PID skeleton)"
+    )
     sub = p.add_subparsers(dest="cmd", required=False)
 
-    # iat command (default)
+    # iat (default)
     pi = sub.add_parser("iat", help="Snapshot import table (IAT) of a running PID")
     pi.add_argument("pid", type=int, help="Target process PID")
     pi.add_argument("--all-modules", action="store_true",
@@ -1004,12 +1055,12 @@ def parse_args():
     pi.add_argument("--no-artifacts", action="store_true", help="Do not write JSON/CSV artifacts")
     pi.add_argument("--limit", type=int, default=50, help="Preview limit for stdout")
 
-    # classify command
+    # classify
     pc = sub.add_parser("classify", help="Strictly decide if a run indicates a probable buffer overflow")
     pc.add_argument("--rc", type=int, required=True, help="Process return code from the run")
     pc.add_argument("--stderr", required=True, help="Path to captured stderr file")
 
-    # classify + repro command
+    # classify-repro
     pr = sub.add_parser("classify-repro", help="Classify overflow; if positive, emit reproducible script and payload")
     pr.add_argument("--rc", type=int, required=True, help="Process return code from the run")
     pr.add_argument("--stderr", required=True, help="Path to captured stderr file")
@@ -1020,30 +1071,15 @@ def parse_args():
     pr.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds for repro")
     pr.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
     pr.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file")
-    pr.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL to include in the repro (repeatable)")
+    pr.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repeatable)")
     pr.add_argument("--out-dir", default="crashes", help="Output directory for payload & repro")
     pr.add_argument("--no-rerun", action="store_true", help="Do not auto-execute the reproducer once")
 
-    # fuzz skeleton command (spawned target; non-operational until you fill TODOs)
-    pf = sub.add_parser("fuzz-skeleton", help="Non-operational fuzzing skeleton with strict overflow-only reporting")
-    pf.add_argument("--target", required=True, help="Path to target binary (for repro bundles)")
-    pf.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True, help="Surface to fuzz")
-    pf.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
-    pf.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
-    pf.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file")
-    pf.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repeatable)")
-    pf.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
-    pf.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
-    pf.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
-    pf.add_argument("--ack-permission", action="store_true",
-                    help="Acknowledges you have explicit permission to test this target (required)")
-    pf.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
-
-    # fuzz skeleton command (spawned target)
+    # fuzz-skeleton (spawn a new process). Allow either a path or resolve from a PID.
     pf = sub.add_parser("fuzz-skeleton", help="Spawned-process fuzzing skeleton")
     tgt = pf.add_mutually_exclusive_group(required=True)
     tgt.add_argument("--target", help="Path to target binary (for repro bundles)")
-    tgt.add_argument("--target-pid", type=int, help="Use the EXE path of this PID as the target")
+    tgt.add_argument("--target-pid", type=int, help="Resolve the EXE path from this running PID")
     pf.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True, help="Surface to fuzz")
     pf.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
     pf.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
@@ -1051,10 +1087,27 @@ def parse_args():
     pf.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repeatable)")
     pf.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
     pf.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
+    pf.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
     pf.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
     pf.add_argument("--ack-permission", action="store_true",
                     help="Acknowledges you have explicit permission to test this target (required)")
-    pf.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
+
+    # fuzz-skeleton-pid (attach to a running process; deliver via file/tcp/pipe)
+    pfp = sub.add_parser("fuzz-skeleton-pid", help="PID fuzzing skeleton (attach to running process)")
+    pfp.add_argument("--pid", type=int, required=True, help="Running process PID to target (read-only attach)")
+    pfp.add_argument("--target", required=True, help="Path to target binary (only for building repro bundles)")
+    pfp.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True,
+                     help="Semantic surface you intend to fuzz (used for repro only)")
+    pfp.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
+    pfp.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv (repro hint)")
+    pfp.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file (repro hint)")
+    pfp.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repro hint)")
+    pfp.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
+    pfp.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
+    pfp.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
+    pfp.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
+    pfp.add_argument("--ack-permission", action="store_true",
+                     help="Acknowledges you have explicit permission to test this running process (required)")
 
     return p.parse_args()
 
