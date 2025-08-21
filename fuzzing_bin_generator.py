@@ -3,7 +3,7 @@
 # - Detects TCP listeners for the PID (via psutil or netstat fallback)
 # - Generates deterministic, varied payloads per port
 # - Emits a seeds/ directory tree + a seeds_manifest.json that maps seeds -> surfaces
-# - Optionally exports a single import file (--export-jsonl / --export-json) suitable for --seeds <file>
+# - Also emits import-ready files: seeds_import.json / seeds_import.jsonl
 #
 # Usage:
 #   python seed_generator.py <PID> [--out seeds] [--per-port 16] [--max-grow 1024] [--http-guess]
@@ -66,7 +66,11 @@ def discover_listeners_netstat(pid: int) -> List[int]:
     Fallback: parse `netstat -ano` (Windows). Collect TCP LISTENING rows for this PID.
     """
     try:
-        out = subprocess.check_output(["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL, encoding="utf-8", errors="ignore")
+        out = subprocess.check_output(
+            ["netstat", "-ano"],
+            text=True, stderr=subprocess.DEVNULL,
+            encoding="utf-8", errors="ignore"
+        )
     except Exception:
         return []
     ports: List[int] = []
@@ -179,7 +183,7 @@ def canned_seeds(http_like: bool=False) -> List[bytes]:
         b"A"*16, b"A"*64, b"A"*256,
         b"\x00"*16, b"\xff"*32,
         b"%x%x%x%n", b"{0}{1}{2}",
-        ("𝔸" * 16).encode("utf-8"),           # <-- fixed (no stray space)
+        ("𝔸" * 16).encode("utf-8"),
         b"\x01\x02\x7f\xff/\x5c..%$'\"\x00\x0a\x0d",
     ]
     body = b"B"*32
@@ -224,8 +228,8 @@ def main():
     ap.add_argument("--max-grow", type=int, default=1024, help="Max growth per mutation")
     ap.add_argument("--avoid-hex", default="", help="Comma/space-separated hex bytes to avoid (e.g. '00,0a,0d')")
     ap.add_argument("--http-guess", action="store_true", help="If a port looks like HTTP (80/8080/8000/443/3000), add HTTP-ish seeds")
-    ap.add_argument("--export-jsonl", default=None, help="Write a single JSONL seeds file (one record per line).")
-    ap.add_argument("--export-json",  default=None, help="Write a single JSON seeds file with a 'seeds' array.")
+    ap.add_argument("--export-jsonl", default=None, help="(Optional) Also write a global JSONL outside pid folder.")
+    ap.add_argument("--export-json",  default=None, help="(Optional) Also write a global JSON outside pid folder.")
     args = ap.parse_args()
 
     if os.name != "nt":
@@ -240,6 +244,9 @@ def main():
 
     # parse avoid set
     avoid_set = {int(t, 16) & 0xFF for t in re.split(r"[,\s]+", args.avoid_hex) if t} if args.avoid_hex else set()
+
+    pid_root = out_root / f"pid_{args.pid}"
+    ensure_dir(pid_root)
 
     manifest: Dict = {
         "pid": args.pid,
@@ -257,7 +264,7 @@ def main():
     # Per-port seeds
     for port in ports:
         httpish = args.http_guess and port in (80, 8080, 8000, 443, 3000)
-        bucket = out_root / f"pid_{args.pid}" / "tcp" / f"port_{port}"
+        bucket = pid_root / "tcp" / f"port_{port}"
         ensure_dir(bucket)
 
         # Start with canned seeds
@@ -265,7 +272,6 @@ def main():
 
         # Mutate each canned seed deterministically
         mutated: List[bytes] = []
-        # evenly fill to per-port count
         per = max(1, args.per_port)
         idx = 0
         while len(mutated) < per:
@@ -285,10 +291,9 @@ def main():
         })
 
     # Generic seeds for pipe/file/stdin surfaces
-    generic_bucket = out_root / f"pid_{args.pid}" / "generic"
+    generic_bucket = pid_root / "generic"
     ensure_dir(generic_bucket)
     gen_seeds = canned_seeds(http_like=False)
-    # add deterministic mutations of the first generic seed
     extra = [mutate(gen_seeds[0], i, args.max_grow, avoid_set) for i in range(12)]
     gen_paths = write_seed_files(generic_bucket, "generic", gen_seeds + extra)
     manifest["generic"] = {
@@ -298,18 +303,12 @@ def main():
         "seeds": [p.name for p in gen_paths],
     }
 
-    # Write manifest
-    manifest_path = out_root / f"pid_{args.pid}" / "seeds_manifest.json"
-    ensure_dir(manifest_path.parent)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-    # Collect all seeds we just wrote into records for optional export
-    records = []
+    # Build records (data_b64) for import files
+    records: List[dict] = []
     for port_info in manifest["ports"]:
         port_dir = Path(port_info["dir"])
         for name in port_info["seeds"]:
             records.append(seed_record(port_dir / name, f"tcp:{port_info['port']}"))
-
     gen_dir = Path(manifest["generic"]["dir"])
     for name in manifest["generic"]["seeds"]:
         records.append(seed_record(gen_dir / name, "generic"))
@@ -320,6 +319,29 @@ def main():
         "note": "base64-encoded seeds; 'label' hints surface (tcp:<port> or generic)"
     }
 
+    # Write import-ready files into pid folder
+    import_json_path  = pid_root / "seeds_import.json"
+    import_jsonl_path = pid_root / "seeds_import.jsonl"
+    write_json(records, import_json_path, meta)
+    write_jsonl(records, import_jsonl_path)
+
+    # Add seeds directly into manifest so it’s also importable by pid_fuzzer
+    manifest["seeds"] = records
+    manifest["imports_file_json"]  = str(import_json_path.resolve())
+    manifest["imports_file_jsonl"] = str(import_jsonl_path.resolve())
+
+    # Write manifest (now importable by pid_fuzzer --seeds)
+    manifest_path = pid_root / "seeds_manifest.json"
+    ensure_dir(manifest_path.parent)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Optional user-specified global exports
+    if args.export_jsonl:
+        write_jsonl(records, Path(args.export_jsonl))
+    if args.export_json:
+        write_json(records, Path(args.export_json), meta)
+
+    # Summary
     print("\n[+] Seed bin created")
     print(f"    PID: {args.pid}")
     print(f"    Root: {out_root.resolve()}")
@@ -328,16 +350,9 @@ def main():
     else:
         print("    TCP listeners discovered: (none)")
     print(f"    Manifest: {manifest_path.resolve()}")
-
-    if args.export_jsonl:
-        write_jsonl(records, Path(args.export_jsonl))
-        print(f"    Exported JSONL: {Path(args.export_jsonl).resolve()}")
-
-    if args.export_json:
-        write_json(records, Path(args.export_json), meta)
-        print(f"    Exported JSON : {Path(args.export_json).resolve()}")
-
-    print("    Use the 'generic' seeds for named pipes or file-drop delivery.\n")
+    print(f"    Import JSON : {import_json_path.resolve()}")
+    print(f"    Import JSONL: {import_jsonl_path.resolve()}")
+    print("    You can pass ANY of the above three files to pid_fuzzer via --seeds.\n")
 
 if __name__ == "__main__":
     main()
