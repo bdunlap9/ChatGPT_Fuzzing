@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Python 3.9+, Windows only
-import argparse,csv,datetime,json,os,re,sys,socket,time,textwrap
+import argparse,csv,datetime,json,os,re,sys,socket,time,textwrap,base64
 import ctypes as C
 import ctypes.wintypes as W
 from typing import Dict, List, Optional, Tuple
@@ -178,6 +178,20 @@ def ensure_artifacts():
 def loud_banner(msg: str):
     bar = "=" * max(36, len(msg) + 10)
     print(f"\n{bar}\n*** {msg} ***\n{bar}\n")
+
+def load_seeds_from_jsonl(path: str) -> List[bytes]:
+    out: List[bytes] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            rec = json.loads(line)
+            out.append(base64.b64decode(rec["data_b64"]))
+    return out
+
+def load_seeds_from_json(path: str) -> List[bytes]:
+    blob = json.load(open(path, "r", encoding="utf-8"))
+    return [base64.b64decode(r["data_b64"]) for r in blob.get("seeds", [])]
 
 # ---------------- Strict overflow classifier ----------------
 class OverflowClassifier:
@@ -552,15 +566,18 @@ def print_preview(entries: List[Dict], limit: int = 50):
 # ---------------- Fuzzing Skeleton (process-spawn) ----------------
 class FuzzSkeleton:
     """
-    Safe skeleton for wiring your own fuzzing (spawned targets).
-    DOES NOT perform mutations or execution automatically.
-    Implement _mutate and _execute to make it work.
+    Usable fuzzer for spawned targets.
+    - Deterministic, length-bounded mutator
+    - Simple runner for argv/stdin/env/file
     """
     def __init__(self, *, target_path: str, surface: str,
                  timeout: float, arg_index: Optional[int],
                  file_arg_index: Optional[int],
                  env_overrides: Dict[str, str],
                  out_dir: str):
+        import subprocess  # local import to avoid unused when not used
+        self.subprocess = subprocess
+
         self.target_path = target_path
         self.surface = surface
         self.timeout = timeout
@@ -569,61 +586,117 @@ class FuzzSkeleton:
         self.env_overrides = env_overrides
         self.out_dir = out_dir
 
+        self.max_growth = 1024
+        self._avoid_set = set()
+
         self.classifier = OverflowClassifier()
         self.repro = ReproScriptBuilder(out_dir=out_dir)
 
+    # ---- deterministic mutator (same style as PID skeleton) ----
     def _mutate(self, seed: bytes, iteration: int) -> bytes:
-        raise NotImplementedError("FuzzSkeleton._mutate is a stub. Implement your mutation logic.")
+        def xorshift32(x: int) -> int:
+            x ^= (x << 13) & 0xFFFFFFFF
+            x ^= (x >> 17) & 0xFFFFFFFF
+            x ^= (x << 5)  & 0xFFFFFFFF
+            return x & 0xFFFFFFFF
+        def rnd(state: int, mod: int) -> (int, int):
+            state = xorshift32(state)
+            return (state % max(1, mod)), state
+        def sanitize(buf: bytearray, avoid: set) -> bytearray:
+            if not avoid: return buf
+            st = 0xDEADBEEF
+            for i,b in enumerate(buf):
+                if b in avoid:
+                    idx, st = rnd(st, 256)
+                    rep = idx
+                    while rep in avoid:
+                        rep = (rep + 1) & 0xFF
+                    buf[i] = rep
+            return buf
 
+        s = seed or b"A"
+        it = max(0, int(iteration))
+        seed_hash = ((len(s) & 0xFFFF) << 16) ^ (it & 0xFFFF) or 0xBEEFCAFE
+        strat = it % 6
+
+        if strat == 0:
+            return bytes(sanitize(bytearray(s), self._avoid_set))
+        if strat == 1:
+            buf = bytearray(s)
+            pos, seed_hash = rnd(seed_hash, len(buf))
+            bit, seed_hash = rnd(seed_hash, 8)
+            buf[pos] ^= (1 << bit)
+            return bytes(sanitize(buf, self._avoid_set))
+        if strat == 2:
+            interesting = [0x00,0xFF,0x7F,0x80,0x20,0x0A,0x0D,0x09,0x41,0x61,0x2F,0x5C]
+            buf = bytearray(s)
+            pos, seed_hash = rnd(seed_hash, len(buf))
+            buf[pos] = interesting[it % len(interesting)]
+            return bytes(sanitize(buf, self._avoid_set))
+        if strat == 3:
+            buf = bytearray(s)
+            win_len = min(max(2, (it % 7) + 2), max(1, len(buf)))
+            start_max = max(1, len(buf) - win_len + 1)
+            start, seed_hash = rnd(seed_hash, start_max)
+            delta = ((it & 3) - 1)
+            for i in range(start, start + win_len):
+                buf[i] = (buf[i] + delta) & 0xFF
+            return bytes(sanitize(buf, self._avoid_set))
+        if strat == 4:
+            cap = min(len(s) + max(16, min(64, len(s) or 64)), len(s) + self.max_growth)
+            base = s or b"A"
+            rep = (cap + len(base) - 1) // len(base)
+            buf = bytearray((base * rep)[:cap])
+            if buf:
+                pos, seed_hash = rnd(seed_hash, len(buf))
+                buf[pos] = (buf[pos] ^ (it & 0x7F)) & 0xFF
+            return bytes(sanitize(buf, self._avoid_set))
+        mid = len(s) // 2
+        out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
+        return bytes(sanitize(bytearray(out), self._avoid_set))
+
+    # ---- runner for spawned process ----
     def _execute(self, payload: bytes) -> Tuple[int, bytes, bytes]:
-        raise NotImplementedError("FuzzSkeleton._execute is a stub. Implement your runner for the chosen surface.")
+        env = os.environ.copy()
+        env.update(self.env_overrides or {})
 
-    def run(self, seeds: List[bytes], max_iters: int) -> None:
-        if not seeds:
-            print("[fuzz] No seeds provided; nothing to do.")
-            return
-        print(f"[fuzz] Skeleton started | surface={self.surface} | max_iters={max_iters} | seeds={len(seeds)}")
-        for si, seed in enumerate(seeds):
-            print(f"[fuzz] seed {si+1}/{len(seeds)} (len={len(seed)})")
-            for it in range(max_iters):
-                try:
-                    payload = self._mutate(seed, it)
-                except NotImplementedError as e:
-                    print(f"[fuzz] {e.__class__.__name__}: {e}")
-                    print("[fuzz] Exiting skeleton; implement _mutate/_execute to proceed.")
-                    return
-                except Exception as e:
-                    print(f"[fuzz] mutation error at iter {it}: {e}")
-                    continue
+        if self.surface == "argv":
+            if self.arg_index is None:
+                raise ValueError("argv surface requires --arg-index")
+            max_idx = max(self.arg_index, 1)
+            argv = [self.target_path] + ["DUMMY"] * max_idx
+            argv[self.arg_index] = payload.decode("latin-1", errors="ignore")
+            cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                     env=env, timeout=self.timeout)
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
 
-                try:
-                    rc, out, err = self._execute(payload)
-                except NotImplementedError as e:
-                    print(f"[fuzz] {e.__class__.__name__}: {e}")
-                    print("[fuzz] Exiting skeleton; implement _mutate/_execute to proceed.")
-                    return
-                except Exception as e:
-                    print(f"[fuzz] execution error at iter {it}: {e}")
-                    continue
+        if self.surface == "stdin":
+            cp = self.subprocess.run([self.target_path], input=payload,
+                                     stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                     env=env, timeout=self.timeout)
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
 
-                is_overflow, indicators = self.classifier.classify(rc, err)
-                if is_overflow:
-                    print("\n=== PROBABLE BUFFER OVERFLOW ===")
-                    print("Indicators:", ", ".join(indicators))
-                    paths = self.repro.build_and_optionally_run(
-                        target_path=self.target_path,
-                        surface=self.surface,
-                        payload=payload,
-                        timeout=self.timeout,
-                        arg_index=self.arg_index,
-                        env_overrides=self.env_overrides,
-                        file_arg_index=self.file_arg_index,
-                        run_after_write=True
-                    )
-                    print("[fuzz] Repro bundle:", json.dumps(paths, indent=2))
-                    print("[fuzz] Stopping after first overflow (skeleton behavior).")
-                    return
-        print("[fuzz] Skeleton completed without detecting probable buffer overflows.")
+        if self.surface == "env":
+            env2 = env.copy()
+            env2["PAYLOAD"] = payload.decode("latin-1", errors="ignore")
+            cp = self.subprocess.run([self.target_path], stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                     env=env2, timeout=self.timeout)
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
+
+        if self.surface == "file":
+            if self.file_arg_index is None:
+                raise ValueError("file surface requires --file-arg-index")
+            tmp = os.path.join(self.out_dir, f"input_{now_stamp()}.dat")
+            with open(tmp, "wb") as f:
+                f.write(payload)
+            max_idx = max(self.file_arg_index, 1)
+            argv = [self.target_path] + ["DUMMY"] * max_idx
+            argv[self.file_arg_index] = tmp
+            cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                     env=env, timeout=self.timeout)
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
+
+        raise ValueError(f"unknown surface: {self.surface}")
 
 # ---------------- Fuzzing Skeleton for a running PID ----------------
 class FuzzSkeletonPID:
@@ -666,7 +739,7 @@ class FuzzSkeletonPID:
         self._log_pos: int = 0  # rolling file offset for incremental tailing
 
         # Attach read-only to the process (metadata only)
-        access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_VM_OPERATION| 
+        access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
         self.hProcess = OpenProcess(access, False, pid)
         if not self.hProcess:
             _raise_last_error(f"OpenProcess failed for PID {pid}")
@@ -953,6 +1026,7 @@ def parse_args():
     pf.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
     pf.add_argument("--ack-permission", action="store_true",
                     help="Acknowledges you have explicit permission to test this target (required)")
+    pf.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
 
     # fuzz skeleton **for a running PID** (non-operational until you fill TODOs)
     pfp = sub.add_parser("fuzz-skeleton-pid", help="Non-operational PID fuzzing skeleton (attach to running process)")
@@ -967,6 +1041,7 @@ def parse_args():
     pfp.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
     pfp.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
     pfp.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
+    pfp.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
     pfp.add_argument("--ack-permission", action="store_true",
                      help="Acknowledges you have explicit permission to test this running process (required)")
 
@@ -1046,15 +1121,28 @@ def cmd_classify_repro(args):
 
 def cmd_fuzz_skeleton(args):
     if not args.ack_permission:
-        print("[!] Refusing to run: please supply --ack-permission to confirm you have explicit authorization to test this target.")
+        print("[!] Refusing to run: please supply --ack-permission ...")
         sys.exit(2)
 
     seeds: List[bytes] = []
-    for sp in args.seed_bin or []:
-        try:
-            seeds.append(_read_file_bytes(sp))
-        except Exception as e:
-            print(f"[fuzz] Failed to read seed {sp}: {e}")
+
+    # Preferred: --seeds (JSONL/JSON)
+    if args.seeds:
+        if args.seeds.lower().endswith(".jsonl"):
+            seeds = load_seeds_from_jsonl(args.seeds)
+        else:
+            seeds = load_seeds_from_json(args.seeds)
+    else:
+        # Fallback: --seed-bin (raw files)
+        for sp in args.seed_bin or []:
+            try:
+                seeds.append(_read_file_bytes(sp))
+            except Exception as e:
+                print(f"[fuzz] Failed to read seed {sp}: {e}")
+
+    if not os.path.isfile(args.target):
+        print(f"[!] --target must be a PATH to an executable for fuzz-skeleton (got: {args.target})")
+        sys.exit(2)
 
     skel = FuzzSkeleton(
         target_path=args.target,
@@ -1065,20 +1153,25 @@ def cmd_fuzz_skeleton(args):
         env_overrides=_env_list_to_dict(args.env),
         out_dir=args.out_dir
     )
-
     skel.run(seeds=seeds, max_iters=max(1, args.max_iters))
 
 def cmd_fuzz_skeleton_pid(args):
     if not args.ack_permission:
-        print("[!] Refusing to run: please supply --ack-permission to confirm you have explicit authorization to test this running process.")
+        print("[!] Refusing to run: please supply --ack-permission ...")
         sys.exit(2)
 
     seeds: List[bytes] = []
-    for sp in args.seed_bin or []:
-        try:
-            seeds.append(_read_file_bytes(sp))
-        except Exception as e:
-            print(f"[fuzz-pid] Failed to read seed {sp}: {e}")
+    if args.seeds:
+        if args.seeds.lower().endswith(".jsonl"):
+            seeds = load_seeds_from_jsonl(args.seeds)
+        else:
+            seeds = load_seeds_from_json(args.seeds)
+    else:
+        for sp in args.seed_bin or []:
+            try:
+                seeds.append(_read_file_bytes(sp))
+            except Exception as e:
+                print(f"[fuzz-pid] Failed to read seed {sp}: {e}")
 
     skel = FuzzSkeletonPID(
         pid=args.pid,
@@ -1090,7 +1183,6 @@ def cmd_fuzz_skeleton_pid(args):
         env_overrides=_env_list_to_dict(args.env),
         out_dir=args.out_dir
     )
-
     skel.run(seeds=seeds, max_iters=max(1, args.max_iters))
 
 def main():
