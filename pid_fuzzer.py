@@ -563,6 +563,17 @@ def print_preview(entries: List[Dict], limit: int = 50):
     if len(entries) > shown:
         print(f"    ... +{len(entries) - shown} more")
 
+def get_exe_path_from_pid(pid: int) -> str:
+    # reuse our inspector to resolve the path of the main module (the EXE)
+    insp = ProcessImportsInspector(pid)
+    try:
+        mods = insp.list_modules()
+        if not mods:
+            raise RuntimeError(f"No modules found for PID {pid}")
+        return mods[0]["path"]
+    finally:
+        insp.close()
+
 # ---------------- Fuzzing Skeleton (process-spawn) ----------------
 class FuzzSkeleton:
     """
@@ -1028,22 +1039,22 @@ def parse_args():
                     help="Acknowledges you have explicit permission to test this target (required)")
     pf.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
 
-    # fuzz skeleton **for a running PID** (non-operational until you fill TODOs)
-    pfp = sub.add_parser("fuzz-skeleton-pid", help="Non-operational PID fuzzing skeleton (attach to running process)")
-    pfp.add_argument("--pid", type=int, required=True, help="Running process PID to target (read-only attach)")
-    pfp.add_argument("--target", required=True, help="Path to target binary (only for building repro bundles)")
-    pfp.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True,
-                     help="Semantic surface you intend to fuzz (used for repro only)")
-    pfp.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
-    pfp.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv (repro hint)")
-    pfp.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file (repro hint)")
-    pfp.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repro hint)")
-    pfp.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
-    pfp.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
-    pfp.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
-    pfp.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
-    pfp.add_argument("--ack-permission", action="store_true",
-                     help="Acknowledges you have explicit permission to test this running process (required)")
+    # fuzz skeleton command (spawned target)
+    pf = sub.add_parser("fuzz-skeleton", help="Spawned-process fuzzing skeleton")
+    tgt = pf.add_mutually_exclusive_group(required=True)
+    tgt.add_argument("--target", help="Path to target binary (for repro bundles)")
+    tgt.add_argument("--target-pid", type=int, help="Use the EXE path of this PID as the target")
+    pf.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True, help="Surface to fuzz")
+    pf.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
+    pf.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
+    pf.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file")
+    pf.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repeatable)")
+    pf.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
+    pf.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
+    pf.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
+    pf.add_argument("--ack-permission", action="store_true",
+                    help="Acknowledges you have explicit permission to test this target (required)")
+    pf.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
 
     return p.parse_args()
 
@@ -1124,28 +1135,35 @@ def cmd_fuzz_skeleton(args):
         print("[!] Refusing to run: please supply --ack-permission ...")
         sys.exit(2)
 
-    seeds: List[bytes] = []
+    # Resolve target path if a PID was provided
+    target_path = args.target
+    if args.target_pid is not None:
+        try:
+            target_path = get_exe_path_from_pid(args.target_pid)
+            print(f"[fuzz] Resolved PID {args.target_pid} -> {target_path}")
+        except Exception as e:
+            print(f"[!] Failed to resolve EXE path from PID {args.target_pid}: {e}")
+            sys.exit(2)
 
-    # Preferred: --seeds (JSONL/JSON)
+    seeds: List[bytes] = []
     if args.seeds:
         if args.seeds.lower().endswith(".jsonl"):
             seeds = load_seeds_from_jsonl(args.seeds)
         else:
             seeds = load_seeds_from_json(args.seeds)
     else:
-        # Fallback: --seed-bin (raw files)
         for sp in args.seed_bin or []:
             try:
                 seeds.append(_read_file_bytes(sp))
             except Exception as e:
                 print(f"[fuzz] Failed to read seed {sp}: {e}")
 
-    if not os.path.isfile(args.target):
-        print(f"[!] --target must be a PATH to an executable for fuzz-skeleton (got: {args.target})")
+    if not os.path.isfile(target_path):
+        print(f"[!] Target must be a PATH to an executable for fuzz-skeleton (got: {target_path})")
         sys.exit(2)
 
     skel = FuzzSkeleton(
-        target_path=args.target,
+        target_path=target_path,
         surface=args.surface,
         timeout=args.timeout,
         arg_index=args.arg_index,
