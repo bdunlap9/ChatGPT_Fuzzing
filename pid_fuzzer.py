@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 # Python 3.9+, Windows only
-import argparse
-import csv
+import argparse,csv,datetime,json,os,re,sys,socket,time,textwrap
 import ctypes as C
 import ctypes.wintypes as W
-import datetime
-import json
-import os
-import re
-import sys
-import socket
-import time
-import textwrap
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
