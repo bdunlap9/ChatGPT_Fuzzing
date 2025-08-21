@@ -25,6 +25,9 @@ GENERIC_WRITE  = 0x40000000
 OPEN_EXISTING  = 3
 INVALID_HANDLE_VALUE = C.c_void_p(-1).value
 
+kernel32 = C.WinDLL("kernel32", use_last_error=True)
+psapi    = C.WinDLL("psapi",    use_last_error=True)
+
 CreateFileW = kernel32.CreateFileW
 CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD, W.HANDLE]
 CreateFileW.restype  = W.HANDLE
@@ -32,9 +35,6 @@ CreateFileW.restype  = W.HANDLE
 WriteFile = kernel32.WriteFile
 WriteFile.argtypes = [W.HANDLE, W.LPCVOID, W.DWORD, C.POINTER(W.DWORD), W.LPVOID]
 WriteFile.restype  = W.BOOL
-
-kernel32 = C.WinDLL("kernel32", use_last_error=True)
-psapi    = C.WinDLL("psapi",    use_last_error=True)
 
 def _raise_last_error(msg: str):
     err = C.get_last_error()
@@ -634,15 +634,13 @@ class FuzzSkeleton:
 # ---------------- Fuzzing Skeleton for a running PID ----------------
 class FuzzSkeletonPID:
     """
-    Safe, non-operational skeleton that attaches to a running PID (read-only) and
-    provides hooks to deliver inputs via your own IPC (stdin of a child you created,
-    named pipe, socket, WM_* messages, etc.). No code injection or memory writing.
+    Safe, non-operational-by-default skeleton that attaches to a running PID (read-only)
+    and delivers payloads via opt-in transports (noop/file/tcp/pipe). No injection or RPM writes.
 
-    Implement:
-      - _mutate(seed, iteration) -> bytes
-      - _deliver_to_pid(payload) -> None        # your IPC delivery
-      - _collect_signals() -> (return_code, stderr_bytes)
+    Implemented surfaces: delivery to external endpoints you manage; we only *classify*
+    outcomes using a monitor log.
     """
+
     def __init__(self, *, pid: int, target_path_for_repro: str, surface: str,
                  timeout: float,
                  arg_index: Optional[int],
@@ -656,7 +654,7 @@ class FuzzSkeletonPID:
         self.file_arg_index = file_arg_index
         self.env_overrides = env_overrides
         self.out_dir = out_dir
-        self.target_path_for_repro = target_path_for_repro  # used only for building a repro script
+        self.target_path_for_repro = target_path_for_repro  # for repro script
 
         # Transport/monitor configuration via environment variables (no CLI changes needed)
         self.mode = os.environ.get("FUZZ_PID_MODE", "noop").lower()  # noop | file | tcp | pipe
@@ -667,13 +665,18 @@ class FuzzSkeletonPID:
         self.monitor_log = os.environ.get("FUZZ_PID_MONITOR_LOG", None)       # optional path to tail after send
         ensure_outdir(self.drop_dir)
 
-        # Attach read-only to the process for metadata (no writing)
+        # Mutation & log-tail config (env overrides)
+        self.max_growth = int(os.environ.get("FUZZ_PID_MAX_GROW", "1024"))  # cap extension per iter
+        self.avoid_hex  = os.environ.get("FUZZ_PID_AVOID_HEX", "")          # e.g. "00,0a,0d"
+        self._avoid_set = {int(t, 16) & 0xFF for t in re.split(r"[,\s]+", self.avoid_hex) if t} if self.avoid_hex else set()
+        self._log_pos: int = 0  # rolling file offset for incremental tailing
+
+        # Attach read-only to the process (metadata only)
         access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
         self.hProcess = OpenProcess(access, False, pid)
         if not self.hProcess:
             _raise_last_error(f"OpenProcess failed for PID {pid}")
 
-        # Optional: you can use the inspector to enrich context if you wish
         self.classifier = OverflowClassifier()
         self.repro = ReproScriptBuilder(out_dir=out_dir)
 
@@ -682,57 +685,100 @@ class FuzzSkeletonPID:
             CloseHandle(self.hProcess)
             self.hProcess = None
 
-        # ----------------- IMPLEMENTED: deterministic mutator -----------------
+    # ----------------- IMPROVED: deterministic mutator -----------------
     def _mutate(self, seed: bytes, iteration: int) -> bytes:
         """
-        Deterministic, length-bounded mutations for reproducibility.
-        Strategy (rotates every 4 iters):
-          0: identity (seed as-is)
-          1: single-byte flip at a rotating offset
-          2: bounded repeat/extend up to +min(64, len(seed) or 64)
-          3: splice: head + reversed tail
-        Guarantees non-empty output even if seed is empty.
+        Deterministic, length-bounded, byte-safe mutations.
+          0: identity
+          1: single-bit flip
+          2: single-byte overwrite with interesting values
+          3: arithmetic +/- on a sliding window
+          4: bounded repeat/extend (capped by self.max_growth)
+          5: splice: head + reversed tail
+        Honors FUZZ_PID_AVOID_HEX to scrub disallowed bytes.
         """
+        def xorshift32(x: int) -> int:
+            x ^= (x << 13) & 0xFFFFFFFF
+            x ^= (x >> 17) & 0xFFFFFFFF
+            x ^= (x << 5)  & 0xFFFFFFFF
+            return x & 0xFFFFFFFF
+
+        def rnd(state: int, mod: int) -> (int, int):
+            state = xorshift32(state)
+            return (state % max(1, mod)), state
+
+        def sanitize(buf: bytearray) -> bytearray:
+            if not self._avoid_set:
+                return buf
+            st = seed_hash
+            for i, b in enumerate(buf):
+                if b in self._avoid_set:
+                    idx, st = rnd(st, 256)
+                    rep = idx
+                    if rep in self._avoid_set:
+                        rep = (rep + 1) & 0xFF
+                        while rep in self._avoid_set:
+                            rep = (rep + 1) & 0xFF
+                    buf[i] = rep
+            return buf
+
         s = seed or b"A"
         it = max(0, int(iteration))
+        seed_hash = ((len(s) & 0xFFFF) << 16) ^ (it & 0xFFFF) or 0xDEADBEEF
+        strat = it % 6
 
-        if it % 4 == 0:
-            return s
+        if strat == 0:
+            return bytes(sanitize(bytearray(s)))
 
-        if it % 4 == 1:
+        if strat == 1:
             buf = bytearray(s)
-            pos = it % len(buf)
-            buf[pos] ^= 0xFF
-            return bytes(buf)
+            pos, seed_hash = rnd(seed_hash, len(buf))
+            bit, seed_hash = rnd(seed_hash, 8)
+            buf[pos] ^= (1 << bit)
+            return bytes(sanitize(buf))
 
-        if it % 4 == 2:
-            # Extend deterministically but cap growth
-            cap = len(s) + min(64, max(16, len(s)))
-            rep = (cap + len(s) - 1) // len(s)
-            out = (s * rep)[:cap]
-            # also tweak a byte so each iter differs
-            if out:
-                idx = it % len(out)
-                out = bytearray(out)
-                out[idx] = (out[idx] + (it & 0x7F)) & 0xFF
-                out = bytes(out)
-            return out
+        if strat == 2:
+            interesting = [0x00,0xFF,0x7F,0x80,0x20,0x0A,0x0D,0x09,0x41,0x61,0x2F,0x5C]
+            buf = bytearray(s)
+            pos, seed_hash = rnd(seed_hash, len(buf))
+            buf[pos] = interesting[it % len(interesting)]
+            return bytes(sanitize(buf))
 
-        # it % 4 == 3
-        mid = (len(s) // 2) if len(s) else 0
-        return s[:mid] + s[:mid-1:-1]  # head + reversed tail
+        if strat == 3:
+            buf = bytearray(s)
+            win_len = min(max(2, (it % 7) + 2), max(1, len(buf)))
+            start_max = max(1, len(buf) - win_len + 1)
+            start, seed_hash = rnd(seed_hash, start_max)
+            delta = ((it & 3) - 1)  # -1,0,1,2
+            for i in range(start, start + win_len):
+                buf[i] = (buf[i] + delta) & 0xFF
+            return bytes(sanitize(buf))
 
-    # ----------------- IMPLEMENTED: delivery to running PID -----------------
+        if strat == 4:
+            cap = min(len(s) + max(16, min(64, len(s) or 64)), len(s) + self.max_growth)
+            base = s or b"A"
+            rep = (cap + len(base) - 1) // len(base)
+            buf = bytearray((base * rep)[:cap])
+            if buf:
+                pos, seed_hash = rnd(seed_hash, len(buf))
+                buf[pos] = (buf[pos] ^ (it & 0x7F)) & 0xFF
+            return bytes(sanitize(buf))
+
+        mid = len(s) // 2
+        out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
+        return bytes(sanitize(bytearray(out)))
+
+    # ----------------- IMPROVED: delivery to running PID -----------------
     def _deliver_to_pid(self, payload: bytes) -> None:
         """
-        Non-invasive delivery based on configured mode:
-          - noop: log only.
-          - file: write to artifacts/deliveries/<timestamp>.bin  (target must read it itself)
-          - tcp:  connect to (addr, port) and send (blocking); requires FUZZ_PID_TCP_PORT>0
-          - pipe: open named pipe (FUZZ_PID_PIPE_NAME) and write bytes.
-        This does not inject code or write target memory.
+        Delivery modes:
+          - noop : do nothing
+          - file : write artifacts/deliveries/payload_<ts>.bin (+ .meta.json)
+          - tcp  : send to FUZZ_PID_TCP_ADDR:FUZZ_PID_TCP_PORT (with optional newline)
+          - pipe : WaitNamedPipeW + CreateFileW + WriteFile to FUZZ_PID_PIPE_NAME
         """
         mode = self.mode
+
         if mode == "noop":
             print(f"[fuzz-pid] (noop) would deliver {len(payload)} bytes")
             return
@@ -742,6 +788,8 @@ class FuzzSkeletonPID:
             out_path = os.path.join(self.drop_dir, f"payload_{stamp}.bin")
             with open(out_path, "wb") as f:
                 f.write(payload)
+            with open(out_path + ".meta.json", "w", encoding="utf-8") as mf:
+                json.dump({"pid": self.pid, "bytes": len(payload), "timestamp": stamp, "surface": self.surface}, mf, indent=2)
             print(f"[fuzz-pid] (file) wrote payload -> {out_path}")
             return
 
@@ -749,15 +797,27 @@ class FuzzSkeletonPID:
             if not self.tcp_port:
                 raise RuntimeError("FUZZ_PID_TCP_PORT not set or zero for tcp mode")
             addr = self.tcp_addr or "127.0.0.1"
-            with socket.create_connection((addr, self.tcp_port), timeout=self.timeout) as sock:
-                sock.sendall(payload)
-            print(f"[fuzz-pid] (tcp) sent {len(payload)} bytes to {addr}:{self.tcp_port}")
+            attempts = 3
+            for i in range(attempts):
+                try:
+                    with socket.create_connection((addr, self.tcp_port), timeout=self.timeout) as sock:
+                        sock.sendall(payload)
+                        if os.environ.get("FUZZ_PID_TCP_APPEND_NL") == "1":
+                            sock.sendall(b"\n")
+                    print(f"[fuzz-pid] (tcp) sent {len(payload)} bytes to {addr}:{self.tcp_port}")
+                    return
+                except Exception:
+                    if i == attempts - 1:
+                        raise
+                    time.sleep(0.05 * (i + 1))
             return
 
         if mode == "pipe":
             if not self.pipe_name:
                 raise RuntimeError("FUZZ_PID_PIPE_NAME is required for pipe mode, e.g. \\\\.\\pipe\\MyPipe")
-            # Open existing named pipe for write
+            wait_ms = int(float(os.environ.get("FUZZ_PID_PIPE_WAIT_MS", str(int(self.timeout * 1000)))) or 0)
+            if wait_ms > 0:
+                WaitNamedPipeW(self.pipe_name, wait_ms)  # best-effort
             h = CreateFileW(self.pipe_name, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
             if int(h) == 0 or int(h) == INVALID_HANDLE_VALUE:
                 _raise_last_error(f"CreateFileW on pipe failed: {self.pipe_name}")
@@ -773,35 +833,35 @@ class FuzzSkeletonPID:
 
         raise ValueError(f"Unknown FUZZ_PID_MODE='{mode}' (expected noop|file|tcp|pipe)")
 
-    # ----------------- IMPLEMENTED: minimal signal collection -----------------
+    # ----------------- IMPROVED: incremental signal collection -----------------
     def _collect_signals(self) -> Tuple[Optional[int], bytes]:
         """
-        Since we didn't spawn the process, we don't have a return code.
-        We optionally read a monitor log (if FUZZ_PID_MONITOR_LOG is set)
-        and return its content delta as 'stderr-like' bytes.
-        You can improve this by integrating ETW/WER or app-specific logs.
+        We did not spawn the process; return_code is None.
+        If FUZZ_PID_MONITOR_LOG is set, return only NEW bytes since last read.
+        Handles rotation (truncate -> resets offset).
         """
         rc: Optional[int] = None
-
         log_path = self.monitor_log
         if not log_path:
-            # No monitor configured; return empty stderr-like signal
             return rc, b""
 
         p = Path(log_path)
         if not p.exists() or not p.is_file():
-            # Nothing to read yet
             return rc, b""
 
         try:
-            # Read the entire file (simple baseline). For large logs, keep your own file offset.
-            data = p.read_bytes()
+            size = p.stat().st_size
+            if self._log_pos > size:  # rotation/truncation
+                self._log_pos = 0
+            with p.open("rb") as f:
+                f.seek(self._log_pos, os.SEEK_SET)
+                data = f.read()
+                self._log_pos = f.tell()
         except Exception as e:
             print(f"[fuzz-pid] monitor read failed: {e}")
             data = b""
 
-        # Optional: tiny cooldown to let the target flush logs
-        time.sleep(0.01)
+        time.sleep(min(0.02, max(0.0, self.timeout / 200.0)))  # tiny cooldown
         return rc, data
 
     # ----------------- Orchestrator -----------------
@@ -817,20 +877,12 @@ class FuzzSkeletonPID:
                 for it in range(max_iters):
                     try:
                         payload = self._mutate(seed, it)
-                    except NotImplementedError as e:
-                        print(f"[fuzz-pid] {e.__class__.__name__}: {e}")
-                        print("[fuzz-pid] Exiting skeleton; implement _mutate/_deliver_to_pid/_collect_signals.")
-                        return
                     except Exception as e:
                         print(f"[fuzz-pid] mutation error at iter {it}: {e}")
                         continue
 
                     try:
                         self._deliver_to_pid(payload)
-                    except NotImplementedError as e:
-                        print(f"[fuzz-pid] {e.__class__.__name__}: {e}")
-                        print("[fuzz-pid] Exiting skeleton; implement _mutate/_deliver_to_pid/_collect_signals.")
-                        return
                     except Exception as e:
                         print(f"[fuzz-pid] delivery error at iter {it}: {e}")
                         continue
@@ -840,7 +892,6 @@ class FuzzSkeletonPID:
                     if is_overflow:
                         print("\n=== PROBABLE BUFFER OVERFLOW (PID skeleton) ===")
                         print("Indicators:", ", ".join(indicators))
-                        # Build a repro for offline confirmation (spawns a new process)
                         paths = self.repro.build_and_optionally_run(
                             target_path=self.target_path_for_repro,
                             surface=self.surface,
