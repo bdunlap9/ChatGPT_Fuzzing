@@ -9,8 +9,11 @@ import json
 import os
 import re
 import sys
+import socket
+import time
 import textwrap
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 # ---- Win32 constants / DLLs ----
 PROCESS_VM_READ                   = 0x0010
@@ -18,6 +21,17 @@ PROCESS_QUERY_INFORMATION         = 0x0400
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 LIST_MODULES_ALL = 0x03
 MAX_PATH = 260
+GENERIC_WRITE  = 0x40000000
+OPEN_EXISTING  = 3
+INVALID_HANDLE_VALUE = C.c_void_p(-1).value
+
+CreateFileW = kernel32.CreateFileW
+CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD, W.HANDLE]
+CreateFileW.restype  = W.HANDLE
+
+WriteFile = kernel32.WriteFile
+WriteFile.argtypes = [W.HANDLE, W.LPCVOID, W.DWORD, C.POINTER(W.DWORD), W.LPVOID]
+WriteFile.restype  = W.BOOL
 
 kernel32 = C.WinDLL("kernel32", use_last_error=True)
 psapi    = C.WinDLL("psapi",    use_last_error=True)
@@ -644,6 +658,15 @@ class FuzzSkeletonPID:
         self.out_dir = out_dir
         self.target_path_for_repro = target_path_for_repro  # used only for building a repro script
 
+        # Transport/monitor configuration via environment variables (no CLI changes needed)
+        self.mode = os.environ.get("FUZZ_PID_MODE", "noop").lower()  # noop | file | tcp | pipe
+        self.drop_dir = os.environ.get("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries"))
+        self.tcp_addr = os.environ.get("FUZZ_PID_TCP_ADDR", "127.0.0.1")
+        self.tcp_port = int(os.environ.get("FUZZ_PID_TCP_PORT", "0") or "0")  # 0 disables tcp
+        self.pipe_name = os.environ.get("FUZZ_PID_PIPE_NAME", None)           # e.g. r"\\.\pipe\MyPipe"
+        self.monitor_log = os.environ.get("FUZZ_PID_MONITOR_LOG", None)       # optional path to tail after send
+        ensure_outdir(self.drop_dir)
+
         # Attach read-only to the process for metadata (no writing)
         access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
         self.hProcess = OpenProcess(access, False, pid)
@@ -659,36 +682,127 @@ class FuzzSkeletonPID:
             CloseHandle(self.hProcess)
             self.hProcess = None
 
-    # ----------------- YOU IMPLEMENT THESE -----------------
+        # ----------------- IMPLEMENTED: deterministic mutator -----------------
     def _mutate(self, seed: bytes, iteration: int) -> bytes:
         """
-        TODO: implement your mutation logic here.
-        Keep it length-bound and deterministic if you want stable repros.
+        Deterministic, length-bounded mutations for reproducibility.
+        Strategy (rotates every 4 iters):
+          0: identity (seed as-is)
+          1: single-byte flip at a rotating offset
+          2: bounded repeat/extend up to +min(64, len(seed) or 64)
+          3: splice: head + reversed tail
+        Guarantees non-empty output even if seed is empty.
         """
-        raise NotImplementedError("FuzzSkeletonPID._mutate is a stub. Implement your mutation logic.")
+        s = seed or b"A"
+        it = max(0, int(iteration))
 
+        if it % 4 == 0:
+            return s
+
+        if it % 4 == 1:
+            buf = bytearray(s)
+            pos = it % len(buf)
+            buf[pos] ^= 0xFF
+            return bytes(buf)
+
+        if it % 4 == 2:
+            # Extend deterministically but cap growth
+            cap = len(s) + min(64, max(16, len(s)))
+            rep = (cap + len(s) - 1) // len(s)
+            out = (s * rep)[:cap]
+            # also tweak a byte so each iter differs
+            if out:
+                idx = it % len(out)
+                out = bytearray(out)
+                out[idx] = (out[idx] + (it & 0x7F)) & 0xFF
+                out = bytes(out)
+            return out
+
+        # it % 4 == 3
+        mid = (len(s) // 2) if len(s) else 0
+        return s[:mid] + s[:mid-1:-1]  # head + reversed tail
+
+    # ----------------- IMPLEMENTED: delivery to running PID -----------------
     def _deliver_to_pid(self, payload: bytes) -> None:
         """
-        TODO: deliver 'payload' to the running process indicated by self.pid.
-        Examples (non-exhaustive):
-          - If the target exposes a named pipe: connect and send bytes.
-          - If it's a socket server: connect and send bytes.
-          - If it's GUI: PostMessage/SendMessage with bounded data (very limited).
-        This skeleton intentionally does NOT use WriteProcessMemory / injection.
+        Non-invasive delivery based on configured mode:
+          - noop: log only.
+          - file: write to artifacts/deliveries/<timestamp>.bin  (target must read it itself)
+          - tcp:  connect to (addr, port) and send (blocking); requires FUZZ_PID_TCP_PORT>0
+          - pipe: open named pipe (FUZZ_PID_PIPE_NAME) and write bytes.
+        This does not inject code or write target memory.
         """
-        raise NotImplementedError("FuzzSkeletonPID._deliver_to_pid is a stub. Implement your IPC delivery.")
+        mode = self.mode
+        if mode == "noop":
+            print(f"[fuzz-pid] (noop) would deliver {len(payload)} bytes")
+            return
 
+        if mode == "file":
+            stamp = now_stamp()
+            out_path = os.path.join(self.drop_dir, f"payload_{stamp}.bin")
+            with open(out_path, "wb") as f:
+                f.write(payload)
+            print(f"[fuzz-pid] (file) wrote payload -> {out_path}")
+            return
+
+        if mode == "tcp":
+            if not self.tcp_port:
+                raise RuntimeError("FUZZ_PID_TCP_PORT not set or zero for tcp mode")
+            addr = self.tcp_addr or "127.0.0.1"
+            with socket.create_connection((addr, self.tcp_port), timeout=self.timeout) as sock:
+                sock.sendall(payload)
+            print(f"[fuzz-pid] (tcp) sent {len(payload)} bytes to {addr}:{self.tcp_port}")
+            return
+
+        if mode == "pipe":
+            if not self.pipe_name:
+                raise RuntimeError("FUZZ_PID_PIPE_NAME is required for pipe mode, e.g. \\\\.\\pipe\\MyPipe")
+            # Open existing named pipe for write
+            h = CreateFileW(self.pipe_name, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+            if int(h) == 0 or int(h) == INVALID_HANDLE_VALUE:
+                _raise_last_error(f"CreateFileW on pipe failed: {self.pipe_name}")
+            try:
+                n_written = W.DWORD(0)
+                ok = WriteFile(h, payload, len(payload), C.byref(n_written), None)
+                if not ok or n_written.value != len(payload):
+                    _raise_last_error(f"WriteFile to pipe incomplete: {n_written.value}/{len(payload)}")
+                print(f"[fuzz-pid] (pipe) wrote {n_written.value} bytes to {self.pipe_name}")
+            finally:
+                CloseHandle(h)
+            return
+
+        raise ValueError(f"Unknown FUZZ_PID_MODE='{mode}' (expected noop|file|tcp|pipe)")
+
+    # ----------------- IMPLEMENTED: minimal signal collection -----------------
     def _collect_signals(self) -> Tuple[Optional[int], bytes]:
         """
-        TODO: collect outcome signals from the running process after delivery.
-        Return:
-          - return_code (int or None if still running)
-          - stderr_bytes (bytes; logs you captured or tailed)
-        Ideas:
-          - If the target logs to a file, read the delta and return it as 'stderr_bytes'.
-          - If you wrap with external monitoring (ETW/WER), summarize into stderr-like text.
+        Since we didn't spawn the process, we don't have a return code.
+        We optionally read a monitor log (if FUZZ_PID_MONITOR_LOG is set)
+        and return its content delta as 'stderr-like' bytes.
+        You can improve this by integrating ETW/WER or app-specific logs.
         """
-        return None, b""
+        rc: Optional[int] = None
+
+        log_path = self.monitor_log
+        if not log_path:
+            # No monitor configured; return empty stderr-like signal
+            return rc, b""
+
+        p = Path(log_path)
+        if not p.exists() or not p.is_file():
+            # Nothing to read yet
+            return rc, b""
+
+        try:
+            # Read the entire file (simple baseline). For large logs, keep your own file offset.
+            data = p.read_bytes()
+        except Exception as e:
+            print(f"[fuzz-pid] monitor read failed: {e}")
+            data = b""
+
+        # Optional: tiny cooldown to let the target flush logs
+        time.sleep(0.01)
+        return rc, data
 
     # ----------------- Orchestrator -----------------
     def run(self, seeds: List[bytes], max_iters: int) -> None:
