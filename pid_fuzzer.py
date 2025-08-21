@@ -17,6 +17,9 @@ from pathlib import Path
 
 # ---- Win32 constants / DLLs ----
 PROCESS_VM_READ                   = 0x0010
+PROCESS_VM_WRITE                  = 0x0020
+PROCESS_VM_OPERATION              = 0x0008
+PROCESS_CREATE_THREAD             = 0x0002
 PROCESS_QUERY_INFORMATION         = 0x0400
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 LIST_MODULES_ALL = 0x03
@@ -672,7 +675,7 @@ class FuzzSkeletonPID:
         self._log_pos: int = 0  # rolling file offset for incremental tailing
 
         # Attach read-only to the process (metadata only)
-        access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+        access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_VM_OPERATION| 
         self.hProcess = OpenProcess(access, False, pid)
         if not self.hProcess:
             _raise_last_error(f"OpenProcess failed for PID {pid}")
