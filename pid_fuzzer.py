@@ -197,6 +197,128 @@ def load_seeds_from_json(path: str) -> List[bytes]:
     blob = json.load(open(path, "r", encoding="utf-8"))
     return [base64.b64decode(r["data_b64"]) for r in blob.get("seeds", [])]
 
+# ---------- NEW: unified seed loaders & auto-config ----------
+def load_seeds_from_directory(dir_path: str) -> Tuple[List[bytes], List[str]]:
+    """
+    Load all .bin files under a directory tree. Infer labels from folder names:
+      - .../tcp/port_<PORT>/... -> 'tcp:<PORT>'
+      - .../pipe/<NAME>/...     -> 'pipe:<NAME>'
+      - otherwise: 'generic'
+    """
+    seeds: List[bytes] = []
+    labels: List[str] = []
+    for root, _dirs, files in os.walk(dir_path):
+        for fn in files:
+            if not fn.lower().endswith(".bin"):
+                continue
+            p = os.path.join(root, fn)
+            try:
+                with open(p, "rb") as f:
+                    seeds.append(f.read())
+                lab = "generic"
+                lowroot = root.replace("\\", "/").lower()
+                m = re.search(r"/port_(\d+)(?:/|$)", lowroot)
+                if m:
+                    lab = f"tcp:{m.group(1)}"
+                m2 = re.search(r"/pipe/([^/\\]+)(?:/|$)", lowroot)
+                if m2:
+                    lab = f"pipe:{m2.group(1)}"
+                labels.append(lab)
+            except Exception as e:
+                print(f"[seeds] skipping {p}: {e}")
+    return seeds, labels
+
+def load_seeds_any(path: str) -> Tuple[List[bytes], List[str]]:
+    """
+    Accepts:
+      - directory of .bin files (returns inferred labels)
+      - JSONL with 'data_b64' (and optional 'label')
+      - JSON with {"seeds":[...]} (supports seeds_import.json or seeds_manifest.json)
+    Returns: (seeds_bytes_list, labels_list)
+    """
+    if os.path.isdir(path):
+        return load_seeds_from_directory(path)
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".jsonl":
+        seeds: List[bytes] = []
+        labels: List[str] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if "data_b64" in rec:
+                    seeds.append(base64.b64decode(rec["data_b64"]))
+                    labels.append(rec.get("label", ""))
+        return seeds, labels
+
+    # JSON (import json or manifest)
+    blob = json.load(open(path, "r", encoding="utf-8"))
+    recs = blob.get("seeds")
+    if recs is None and isinstance(blob, list):
+        recs = blob
+    if recs is None:
+        recs = []
+    seeds: List[bytes] = []
+    labels: List[str] = []
+    for r in recs:
+        if "data_b64" in r:
+            seeds.append(base64.b64decode(r["data_b64"]))
+            labels.append(r.get("label", ""))
+    return seeds, labels
+
+def maybe_autoconfig_transport_from_labels(labels: List[str]) -> None:
+    """
+    If FUZZ_PID_MODE is unset or 'noop', choose a transport based on labels:
+      - exactly one tcp:<port>  -> mode=tcp with 127.0.0.1:<port>
+      - exactly one pipe:<name> -> mode=pipe with \\.\pipe\<name>
+      - otherwise               -> mode=file (drop dir created)
+    Will NOT override an already-set non-'noop' FUZZ_PID_MODE.
+    """
+    mode = (os.environ.get("FUZZ_PID_MODE") or "noop").lower()
+    if mode != "noop":
+        print(f"[auto] FUZZ_PID_MODE already set to '{mode}', not overriding.")
+        return
+
+    tcp_ports: List[int] = []
+    pipes: List[str] = []
+    for lab in labels or []:
+        if isinstance(lab, str) and lab.startswith("tcp:"):
+            try:
+                tcp_ports.append(int(lab.split(":", 1)[1]))
+            except Exception:
+                pass
+        elif isinstance(lab, str) and lab.startswith("pipe:"):
+            pipes.append(lab.split(":", 1)[1])
+
+    tcp_ports = sorted(set(tcp_ports))
+    seen = set()
+    pipes = [p for p in pipes if not (p in seen or seen.add(p))]
+
+    if len(tcp_ports) == 1 and not pipes:
+        os.environ["FUZZ_PID_MODE"] = "tcp"
+        os.environ.setdefault("FUZZ_PID_TCP_ADDR", "127.0.0.1")
+        os.environ["FUZZ_PID_TCP_PORT"] = str(tcp_ports[0])
+        print(f"[auto] FUZZ_PID_MODE=tcp  FUZZ_PID_TCP_ADDR={os.environ['FUZZ_PID_TCP_ADDR']}  FUZZ_PID_TCP_PORT={os.environ['FUZZ_PID_TCP_PORT']}")
+        return
+
+    if len(pipes) == 1 and not tcp_ports:
+        os.environ["FUZZ_PID_MODE"] = "pipe"
+        pipe_name = pipes[0]
+        if not pipe_name.startswith(r"\\.\pipe\\") and not pipe_name.startswith(r"\\.\pipe\ "):
+            os.environ["FUZZ_PID_PIPE_NAME"] = r"\\.\pipe\\" + pipe_name
+        else:
+            os.environ["FUZZ_PID_PIPE_NAME"] = pipe_name
+        print(f"[auto] FUZZ_PID_MODE=pipe FUZZ_PID_PIPE_NAME={os.environ['FUZZ_PID_PIPE_NAME']}")
+        return
+
+    os.environ["FUZZ_PID_MODE"] = "file"
+    os.environ.setdefault("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries")))
+    ensure_outdir(os.environ["FUZZ_PID_DROP_DIR"])
+    print(f"[auto] FUZZ_PID_MODE=file FUZZ_PID_DROP_DIR={os.environ['FUZZ_PID_DROP_DIR']}")
+
 # ---------------- Strict overflow classifier ----------------
 class OverflowClassifier:
     """
@@ -1087,7 +1209,8 @@ def parse_args():
     pf.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repeatable)")
     pf.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
     pf.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
-    pf.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
+    pf.add_argument("--seeds", default=None,
+                    help="Import seeds from a file (.json|.jsonl|manifest) or a directory of .bin files")
     pf.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
     pf.add_argument("--ack-permission", action="store_true",
                     help="Acknowledges you have explicit permission to test this target (required)")
@@ -1104,10 +1227,13 @@ def parse_args():
     pfp.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repro hint)")
     pfp.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
     pfp.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
-    pfp.add_argument("--seeds", default=None, help="Import seeds file (.jsonl or .json)")
+    pfp.add_argument("--seeds", default=None,
+                     help="Import seeds from a file (.json|.jsonl|manifest) or a directory of .bin files")
     pfp.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
     pfp.add_argument("--ack-permission", action="store_true",
                      help="Acknowledges you have explicit permission to test this running process (required)")
+    pfp.add_argument("--no-auto-config", action="store_true",
+                     help="Disable auto FUZZ_PID_* transport config derived from seed labels")
 
     return p.parse_args()
 
@@ -1183,6 +1309,20 @@ def cmd_classify_repro(args):
         "repro_paths": paths
     }, indent=2))
 
+def _dedupe_bytes_with_labels(seeds: List[bytes], labels: List[str]) -> Tuple[List[bytes], List[str]]:
+    if not seeds:
+        return seeds, labels
+    seen = set()
+    uniq_b: List[bytes] = []
+    uniq_l: List[str] = []
+    for b, lab in zip(seeds, labels or [""] * len(seeds)):
+        if b in seen:
+            continue
+        seen.add(b)
+        uniq_b.append(b)
+        uniq_l.append(lab)
+    return uniq_b, uniq_l
+
 def cmd_fuzz_skeleton(args):
     if not args.ack_permission:
         print("[!] Refusing to run: please supply --ack-permission ...")
@@ -1199,21 +1339,33 @@ def cmd_fuzz_skeleton(args):
             sys.exit(2)
 
     seeds: List[bytes] = []
+    labels: List[str] = []
     if args.seeds:
-        if args.seeds.lower().endswith(".jsonl"):
-            seeds = load_seeds_from_jsonl(args.seeds)
-        else:
-            seeds = load_seeds_from_json(args.seeds)
+        try:
+            seeds, labels = load_seeds_any(args.seeds)
+        except Exception as e:
+            print(f"[fuzz] Failed unified seed load ({e}); falling back.")
+            if args.seeds.lower().endswith(".jsonl"):
+                seeds = load_seeds_from_jsonl(args.seeds)
+            else:
+                seeds = load_seeds_from_json(args.seeds)
     else:
         for sp in args.seed_bin or []:
             try:
-                seeds.append(_read_file_bytes(sp))
+                with open(sp, "rb") as f:
+                    seeds.append(f.read())
             except Exception as e:
                 print(f"[fuzz] Failed to read seed {sp}: {e}")
+
+    if seeds:
+        seeds, _ = _dedupe_bytes_with_labels(seeds, labels)
 
     if not os.path.isfile(target_path):
         print(f"[!] Target must be a PATH to an executable for fuzz-skeleton (got: {target_path})")
         sys.exit(2)
+
+    if not seeds:
+        print("[!] No seeds loaded.")
 
     skel = FuzzSkeleton(
         target_path=target_path,
@@ -1232,17 +1384,46 @@ def cmd_fuzz_skeleton_pid(args):
         sys.exit(2)
 
     seeds: List[bytes] = []
+    labels: List[str] = []
     if args.seeds:
-        if args.seeds.lower().endswith(".jsonl"):
-            seeds = load_seeds_from_jsonl(args.seeds)
-        else:
-            seeds = load_seeds_from_json(args.seeds)
+        try:
+            seeds, labels = load_seeds_any(args.seeds)
+        except Exception as e:
+            print(f"[fuzz-pid] Failed unified seed load ({e}); falling back.")
+            if args.seeds.lower().endswith(".jsonl"):
+                seeds = load_seeds_from_jsonl(args.seeds)
+            else:
+                seeds = load_seeds_from_json(args.seeds)
     else:
         for sp in args.seed_bin or []:
             try:
-                seeds.append(_read_file_bytes(sp))
+                with open(sp, "rb") as f:
+                    seeds.append(f.read())
+                    labels.append("")  # unknown
             except Exception as e:
                 print(f"[fuzz-pid] Failed to read seed {sp}: {e}")
+
+    if seeds:
+        seeds, labels = _dedupe_bytes_with_labels(seeds, labels)
+
+    if not seeds:
+        print("[!] No seeds loaded.")
+    else:
+        by = {"tcp": 0, "pipe": 0, "generic": 0, "other": 0}
+        for lab in labels:
+            if isinstance(lab, str) and lab.startswith("tcp:"):
+                by["tcp"] += 1
+            elif isinstance(lab, str) and lab.startswith("pipe:"):
+                by["pipe"] += 1
+            elif lab == "generic":
+                by["generic"] += 1
+            else:
+                by["other"] += 1
+        print(f"[fuzz-pid] Seeds loaded: {len(seeds)}  (tcp={by['tcp']}, pipe={by['pipe']}, generic={by['generic']}, other={by['other']})")
+
+    # Auto-configure transport from labels unless disabled
+    if seeds and not getattr(args, "no_auto_config", False):
+        maybe_autoconfig_transport_from_labels(labels)
 
     skel = FuzzSkeletonPID(
         pid=args.pid,
