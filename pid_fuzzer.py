@@ -791,49 +791,78 @@ class FuzzSkeleton:
         mid = len(s) // 2
         out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
         return bytes(sanitize(bytearray(out), self._avoid_set))
+    
+    def _choose_surface_for_payload(self, payload: bytes) -> Tuple[str, Optional[int], Optional[int]]:
+        """
+        Decide how to drive the target for THIS payload.
+        Priority:
+        1) argv  (requires --arg-index AND no NUL bytes in payload)
+        2) file  (requires --file-arg-index)
+        3) stdin (fallback)
+        4) env   (only if user explicitly selected it)
+        Returns: (surface, arg_index, file_arg_index)
+        """
+        if self.surface != "auto":
+            return self.surface, self.arg_index, self.file_arg_index
+
+        # Prefer argv if user provided an index and payload is argv-safe (no NULs)
+        if self.arg_index is not None and b"\x00" not in payload:
+            return "argv", self.arg_index, None
+
+        # Next best: file if we can pass a path positionally
+        if self.file_arg_index is not None:
+            return "file", None, self.file_arg_index
+
+        # Safe fallback
+        return "stdin", None, None
 
     # ---- runner for spawned process ----
     def _execute(self, payload: bytes) -> Tuple[int, bytes, bytes]:
         env = os.environ.copy()
         env.update(self.env_overrides or {})
 
-        if self.surface == "argv":
-            if self.arg_index is None:
-                raise ValueError("argv surface requires --arg-index")
-            max_idx = max(self.arg_index, 1)
+        chosen_surface, arg_idx, file_idx = self._choose_surface_for_payload(payload)
+        # Tiny trace to understand choices during runs
+        if self.surface == "auto":
+            print(f"[fuzz:auto] chose surface={chosen_surface} (arg_index={arg_idx}, file_arg_index={file_idx})")
+
+        if chosen_surface == "argv":
+            if arg_idx is None:
+                raise ValueError("argv surface requires --arg-index (auto)")
+            max_idx = max(arg_idx, 1)
             argv = [self.target_path] + ["DUMMY"] * max_idx
-            argv[self.arg_index] = payload.decode("latin-1", errors="ignore")
+            argv[arg_idx] = payload.decode("latin-1", errors="ignore")
             cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env, timeout=self.timeout)
+                                    env=env, timeout=self.timeout)
             return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
 
-        if self.surface == "stdin":
+        if chosen_surface == "stdin":
             cp = self.subprocess.run([self.target_path], input=payload,
-                                     stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env, timeout=self.timeout)
+                                    stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                    env=env, timeout=self.timeout)
             return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
 
-        if self.surface == "env":
+        if chosen_surface == "env":
             env2 = env.copy()
             env2["PAYLOAD"] = payload.decode("latin-1", errors="ignore")
             cp = self.subprocess.run([self.target_path], stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env2, timeout=self.timeout)
+                                    env=env2, timeout=self.timeout)
             return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
 
-        if self.surface == "file":
-            if self.file_arg_index is None:
-                raise ValueError("file surface requires --file-arg-index")
+        if chosen_surface == "file":
+            if file_idx is None:
+                raise ValueError("file surface requires --file-arg-index (auto)")
             tmp = os.path.join(self.out_dir, f"input_{now_stamp()}.dat")
             with open(tmp, "wb") as f:
                 f.write(payload)
-            max_idx = max(self.file_arg_index, 1)
+            max_idx = max(file_idx, 1)
             argv = [self.target_path] + ["DUMMY"] * max_idx
-            argv[self.file_arg_index] = tmp
+            argv[file_idx] = tmp
             cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env, timeout=self.timeout)
+                                    env=env, timeout=self.timeout)
             return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
 
-        raise ValueError(f"unknown surface: {self.surface}")
+        raise ValueError(f"unknown surface: {chosen_surface}")
 
     # ---- orchestrator for spawned process ----
     def run(self, seeds: List[bytes], max_iters: int) -> None:
@@ -1219,8 +1248,10 @@ def parse_args():
     pfp = sub.add_parser("fuzz-skeleton-pid", help="PID fuzzing skeleton (attach to running process)")
     pfp.add_argument("--pid", type=int, required=True, help="Running process PID to target (read-only attach)")
     pfp.add_argument("--target", required=True, help="Path to target binary (only for building repro bundles)")
-    pfp.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True,
-                     help="Semantic surface you intend to fuzz (used for repro only)")
+    pf.add_argument("--surface",choices=["auto", "argv", "stdin", "env", "file"],default="auto",help="Surface to fuzz; 'auto' chooses argv (if possible), else file (if --file-arg-index), else stdin (default: auto)")
+
+    # fuzz-skeleton-pid (attach to a running process; deliver via file/tcp/pipe)
+    pfp.add_argument("--surface",choices=["auto", "argv", "stdin", "env", "file"],default="auto",help="Semantic surface for repro bundles; 'auto' prefers argv (if possible), else file (if --file-arg-index), else stdin (default: auto)")
     pfp.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
     pfp.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv (repro hint)")
     pfp.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file (repro hint)")
