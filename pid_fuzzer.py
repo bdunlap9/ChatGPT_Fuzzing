@@ -1216,8 +1216,6 @@ def parse_args():
     pr.add_argument("--rc", type=int, required=True, help="Process return code from the run")
     pr.add_argument("--stderr", required=True, help="Path to captured stderr file")
     pr.add_argument("--target", required=True, help="Target binary path for the reproducer")
-    pr.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True,
-                    help="Surface used when the overflow occurred")
     pr.add_argument("--payload-bin", required=True, help="Path to the exact payload bytes that triggered the issue")
     pr.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds for repro")
     pr.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
@@ -1231,12 +1229,7 @@ def parse_args():
     tgt = pf.add_mutually_exclusive_group(required=True)
     tgt.add_argument("--target", help="Path to target binary (for repro bundles)")
     tgt.add_argument("--target-pid", type=int, help="Resolve the EXE path from this running PID")
-    pf.add_argument(
-        "--surface",
-        choices=["auto", "argv", "stdin", "env", "file"],
-        default="auto",
-        help="Surface to fuzz; 'auto' chooses argv (if possible, no NULs and --arg-index), else file (if --file-arg-index), else stdin (default: auto)"
-    )
+    pf.add_argument("--surface", choices=["auto", "argv", "stdin", "env", "file"], default="auto", help="Surface to fuzz; 'auto' chooses argv (if possible, no NULs and --arg-index), else file (if --file-arg-index), else stdin (default: auto)")
     pf.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
     pf.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
     pf.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file")
@@ -1253,7 +1246,24 @@ def parse_args():
     pfp = sub.add_parser("fuzz-skeleton-pid", help="PID fuzzing skeleton (attach to running process)")
     pfp.add_argument("--pid", type=int, required=True, help="Running process PID to target (read-only attach)")
     pfp.add_argument("--target", required=True, help="Path to target binary (only for building repro bundles)")
+    
+    # fuzz-skeleton-pid (attach to a running process; deliver via file/tcp/pipe)
     pfp.add_argument("--surface",choices=["auto", "argv", "stdin", "env", "file"],default="auto",help="Semantic surface for repro bundles; 'auto' prefers argv (if possible), else file (if --file-arg-index), else stdin)")
+    pfp.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
+    pfp.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv (repro hint)")
+    pfp.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file (repro hint)")
+    pfp.add_argument("--env", action="append", default=[], help="ENV override KEY=VAL (repro hint)")
+    pfp.add_argument("--out-dir", default="crashes", help="Where to write repro bundles")
+    pfp.add_argument("--seed-bin", action="append", default=[], help="Seed payload file (binary). Repeatable.")
+    pfp.add_argument("--seeds", default=None,
+                     help="Import seeds from a file (.json|.jsonl|manifest) or a directory of .bin files")
+    pfp.add_argument("--max-iters", type=int, default=50, help="Iterations per seed (skeleton)")
+    pfp.add_argument("--ack-permission", action="store_true",
+                     help="Acknowledges you have explicit permission to test this running process (required)")
+    pfp.add_argument("--no-auto-config", action="store_true",
+                     help="Disable auto FUZZ_PID_* transport config derived from seed labels")
+
+    return p.parse_args()
 
 def _read_file_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
