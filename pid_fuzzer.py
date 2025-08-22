@@ -315,7 +315,7 @@ def maybe_autoconfig_transport_from_labels(labels: List[str]) -> None:
         return
 
     os.environ["FUZZ_PID_MODE"] = "file"
-    os.environ.setdefault("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries")))
+    os.environ.setdefault("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries"))
     ensure_outdir(os.environ["FUZZ_PID_DROP_DIR"])
     print(f"[auto] FUZZ_PID_MODE=file FUZZ_PID_DROP_DIR={os.environ['FUZZ_PID_DROP_DIR']}")
 
