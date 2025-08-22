@@ -277,7 +277,8 @@ def maybe_autoconfig_transport_from_labels(labels: List[str]) -> None:
       - otherwise               -> mode=file (drop dir created)
     Will NOT override an already-set non-'noop' FUZZ_PID_MODE.
     """
-    mode = (os.environ.get("FUZZ_PID_MODE") or "noop").lower()
+    mode = ((os.environ.get("FUZZ_PID_MODE") or "noop").strip()).lower()
+
     if mode != "noop":
         print(f"[auto] FUZZ_PID_MODE already set to '{mode}', not overriding.")
         return
@@ -317,7 +318,7 @@ def maybe_autoconfig_transport_from_labels(labels: List[str]) -> None:
     os.environ["FUZZ_PID_MODE"] = "file"
     os.environ.setdefault("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries"))
     ensure_outdir(os.environ["FUZZ_PID_DROP_DIR"])
-    print(f"[auto] FUZZ_PID_MODE=file FUZZ_PID_DROP_DIR={os.environ['FUZZ_PID_DROP_DIR']}")
+    print(f"[auto] effective FUZZ_PID_MODE={os.environ['FUZZ_PID_MODE']!r}")
 
 # ---------------- Strict overflow classifier ----------------
 class OverflowClassifier:
@@ -935,12 +936,16 @@ class FuzzSkeletonPID:
         self.target_path_for_repro = target_path_for_repro  # for repro script
 
         # Transport/monitor configuration via environment variables (no CLI changes needed)
-        self.mode = os.environ.get("FUZZ_PID_MODE", "noop").lower()  # noop | file | tcp | pipe
-        self.drop_dir = os.environ.get("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries"))
-        self.tcp_addr = os.environ.get("FUZZ_PID_TCP_ADDR", "127.0.0.1")
-        self.tcp_port = int(os.environ.get("FUZZ_PID_TCP_PORT", "0") or "0")  # 0 disables tcp
-        self.pipe_name = os.environ.get("FUZZ_PID_PIPE_NAME", None)           # e.g. r"\\.\pipe\MyPipe"
-        self.monitor_log = os.environ.get("FUZZ_PID_MONITOR_LOG", None)       # optional path to tail after send
+        self.mode = (os.environ.get("FUZZ_PID_MODE", "noop") or "noop").strip().lower()
+        self.drop_dir = (os.environ.get("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries")) or "").strip() or os.path.join("artifacts", "deliveries")
+        self.tcp_addr = (os.environ.get("FUZZ_PID_TCP_ADDR", "127.0.0.1") or "127.0.0.1").strip()
+        self.tcp_port = int((os.environ.get("FUZZ_PID_TCP_PORT", "0") or "0").strip() or "0")
+        self.pipe_name = (os.environ.get("FUZZ_PID_PIPE_NAME", "") or "").strip() or None
+        self.monitor_log = (os.environ.get("FUZZ_PID_MONITOR_LOG", "") or "").strip() or None
+
+        self.max_growth = int((os.environ.get("FUZZ_PID_MAX_GROW", "1024") or "1024").strip())
+        self.avoid_hex  = (os.environ.get("FUZZ_PID_AVOID_HEX", "") or "").strip()
+
         ensure_outdir(self.drop_dir)
 
         # Mutation & log-tail config (env overrides)
@@ -1246,7 +1251,7 @@ def parse_args():
     pfp = sub.add_parser("fuzz-skeleton-pid", help="PID fuzzing skeleton (attach to running process)")
     pfp.add_argument("--pid", type=int, required=True, help="Running process PID to target (read-only attach)")
     pfp.add_argument("--target", required=True, help="Path to target binary (only for building repro bundles)")
-    
+
     # fuzz-skeleton-pid (attach to a running process; deliver via file/tcp/pipe)
     pfp.add_argument("--surface",choices=["auto", "argv", "stdin", "env", "file"],default="auto",help="Semantic surface for repro bundles; 'auto' prefers argv (if possible), else file (if --file-arg-index), else stdin)")
     pfp.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
