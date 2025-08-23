@@ -1248,83 +1248,191 @@ class FuzzSkeletonPID:
 
     # ---- deterministic mutator (same ideas as spawn) ----
     def _mutate(self, seed: bytes, iteration: int) -> bytes:
-        def xorshift32(x: int) -> int:
-            x ^= (x << 13) & 0xFFFFFFFF
-            x ^= (x >> 17) & 0xFFFFFFFF
-            x ^= (x << 5)  & 0xFFFFFFFF
-            return x & 0xFFFFFFFF
-        def rnd(state: int, mod: int) -> (int, int):
-            state = xorshift32(state)
-            return (state % max(1, mod)), state
-        def sanitize(buf: bytearray) -> bytearray:
-            if not self._avoid_set:
-                return buf
-            st = 0xDEADBEEF
-            for i, b in enumerate(buf):
-                if b in self._avoid_set:
-                    idx, st = rnd(st, 256)
-                    rep = idx
-                    if rep in self._avoid_set:
-                        rep = (rep + 1) & 0xFF
-                        while rep in self._avoid_set:
-                            rep = (rep + 1) & 0xFF
-                    buf[i] = rep
-            return buf
+        """
+        Deterministic, variable-length mutator with strong sanitization.
+        - Uses a 64-bit xorshift* PRNG seeded from (seed, iteration)
+        - Avoids constant-size outputs via a triangular length schedule + jitter
+        - Rich strategy set (bit/byte flips, arithmetic windows, splice/reverse,
+        rotate, insert/delete/dup chunks, endian flips, token injection)
+        - Honors self._avoid_set to scrub disallowed bytes (e.g., 0x00 for argv)
+        - Capped growth via self.max_growth
+        """
+        import hashlib
 
+        # ---------- tiny RNG (64-bit xorshift*) ----------
+        MASK64 = (1 << 64) - 1
+        def xs64(x: int) -> int:
+            x &= MASK64
+            x ^= (x >> 12) & MASK64
+            x ^= (x << 25) & MASK64
+            x ^= (x >> 27) & MASK64
+            return (x * 0x2545F4914F6CDD1D) & MASK64
+
+        def rnd(state: int, mod: int) -> (int, int):
+            state = xs64(state or 0x9E3779B97F4A7C15)
+            if mod <= 1:
+                return 0, state
+            return int(state % mod), state
+
+    # ---------- sanitize disallowed bytes ----------
+    def sanitize(buf: bytearray, state_seed: int) -> bytearray:
+        if not getattr(self, "_avoid_set", None):
+            return buf
+        allowed = [b for b in range(256) if b not in self._avoid_set]
+        if not allowed:
+            return buf  # nothing we can do
+        st = state_seed
+        alen = len(allowed)
+        # fast path: avoid_set is small in typical usage
+        for i, b in enumerate(buf):
+            if b in self._avoid_set:
+                idx, st = rnd(st, alen)
+                buf[i] = allowed[idx]
+        return buf
+
+    # ---------- helpers ----------
+    def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
         s = seed or b"A"
         it = max(0, int(iteration))
-        strat = it % 7
 
+        # stable 64-bit seed from (seed, iteration)
+        h = hashlib.blake2s(s or b"\x41", digest_size=16, person=b"mutate").digest()
+        seed_state = int.from_bytes(h[:8], "little") ^ (it & MASK64) or 0x9E3779B97F4A7C15
+
+        base_len = max(1, len(s))
+        span_cap = max(32, base_len // 2 + 16)
+        span = min(int(getattr(self, "max_growth", 1024)), span_cap)
+
+        # triangular length schedule to avoid constant-size payloads
+        block = 16
+        step = max(1, span // block)
+        phase = (it // block) % 2
+        offset = (it % block) * step
+        target_len = base_len + (offset if phase == 0 else (span - offset))
+        # tiny deterministic jitter
+        j, seed_state = rnd(seed_state, 7)
+        target_len = clamp(target_len + (j - 3), 1, base_len + span)
+
+        # start from a stretched/truncated base at target_len
+        rep = (target_len + base_len - 1) // base_len
+        buf = bytearray((s * rep)[:target_len])
+
+        # ---------- choose strategy ----------
+        # 0..10 (11 strategies)
+        strat = it % 11
+
+        # strategy implementations
         if strat == 0:
-            out = bytes(sanitize(bytearray(s)))
+            # identity + sanitize
+            pass
+
         elif strat == 1:
-            buf = bytearray(s)
-            pos = (len(buf) and (it % len(buf))) or 0
-            bit = (it >> 5) & 7
-            buf[pos] ^= (1 << bit)
-            out = bytes(sanitize(buf))
-        elif strat == 2:
-            interesting = [0x00,0xFF,0x7F,0x80,0x20,0x0A,0x0D,0x09,0x41,0x61,0x2F,0x5C]
-            buf = bytearray(s)
-            pos = (len(buf) and (it % len(buf))) or 0
-            buf[pos] = interesting[it % len(interesting)]
-            out = bytes(sanitize(buf))
-        elif strat == 3:
-            buf = bytearray(s)
-            win_len = min(max(2, (it % 7) + 2), max(1, len(buf)))
-            start_max = max(1, len(buf) - win_len + 1)
-            start = it % start_max
-            delta = ((it & 3) - 1)
-            for i in range(start, start + win_len):
-                buf[i] = (buf[i] + delta) & 0xFF
-            out = bytes(sanitize(buf))
-        elif strat == 4:
-            cap = min(len(s) + max(16, min(128, len(s) or 64)), len(s) + self.max_growth)
-            base = s or b"A"
-            rep = (cap + len(base) - 1) // len(base)
-            buf = bytearray((base * rep)[:cap])
+            # single bit flip
             if buf:
-                pos = it % len(buf)
-                buf[pos] = (buf[pos] ^ (it & 0x7F)) & 0xFF
-            out = bytes(sanitize(buf))
-        elif strat == 5 and self.tokens:
-            tok = random.choice(self.tokens)
-            pos = (len(s)+1) and (it % (len(s)+1))
-            out = s[:pos] + tok + s[pos:]
-        else:
-            mid = len(s) // 2
-            out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
+                pos, seed_state = rnd(seed_state, len(buf))
+                bit, seed_state = rnd(seed_state, 8)
+                buf[pos] ^= (1 << bit)
 
-        target_len = _length_schedule(it, len(s), self.max_growth)
-        if len(out) < target_len:
-            out = (out + out[::-1] + b"A"*target_len)[:target_len]
-        elif len(out) > target_len:
-            head = target_len // 2
-            tail = target_len - head
-            out = out[:head] + out[-tail:]
+        elif strat == 2:
+            # overwrite with interesting byte
+            interesting = [0x00,0xFF,0x7F,0x80,0x20,0x0A,0x0D,0x09,0x41,0x61,0x2F,0x5C]
+            if buf:
+                pos, seed_state = rnd(seed_state, len(buf))
+                bidx, seed_state = rnd(seed_state, len(interesting))
+                buf[pos] = interesting[bidx]
 
-        return bytes(out)
+        elif strat == 3:
+            # sliding window arithmetic +/- delta
+            if buf:
+                win = clamp(2 + (it % 7), 2, len(buf))
+                start, seed_state = rnd(seed_state, max(1, len(buf) - win + 1))
+                delta = (-1 + (it & 3))  # -1,0,1,2
+                for i in range(start, start + win):
+                    buf[i] = (buf[i] + delta) & 0xFF
 
+        elif strat == 4:
+            # splice: head + reversed tail
+            if len(buf) >= 3:
+                mid = len(buf) // 2
+                tail = buf[mid:]
+                buf = bytearray(buf[:mid] + tail[::-1])
+
+        elif strat == 5:
+            # byte-rotate a small window
+            if len(buf) >= 3:
+                win = clamp(2 + (it % 8), 2, len(buf))
+                start, seed_state = rnd(seed_state, len(buf) - win + 1)
+                w = buf[start:start+win]
+                buf[start:start+win] = bytearray([w[-1]]) + w[:-1]
+
+        elif strat == 6:
+            # duplicate a random chunk (bounded by growth)
+            if buf:
+                max_ins = clamp(span // 4, 1, max(1, len(buf)))
+                clen, seed_state = rnd(seed_state, max_ins)
+                clen = clamp(clen, 1, len(buf))
+                off, seed_state = rnd(seed_state, len(buf) - clen + 1)
+                chunk = buf[off:off+clen]
+                ins_at, seed_state = rnd(seed_state, len(buf) + 1)
+                buf[ins_at:ins_at] = chunk
+                if len(buf) > base_len + span:
+                    del buf[base_len + span:]  # hard cap
+
+        elif strat == 7:
+            # delete a random chunk
+            if len(buf) >= 3:
+                max_del = clamp(len(buf) // 8, 1, len(buf) // 2)
+                dlen, seed_state = rnd(seed_state, max_del)
+                dlen = clamp(dlen, 1, len(buf) - 1)
+                off, seed_state = rnd(seed_state, len(buf) - dlen + 1)
+                del buf[off:off+dlen]
+
+        elif strat == 8:
+            # insert "tokens" that often tickle parsers/boundaries
+            tokens = [b"%n", b"%s", b"%x", b"../../", b"..\\", b"AAAA", b"../", b"\\..\\",
+                    b"9999999999", b"-1", b"0", b"NaN", b"inf", b"-inf"]
+            tok_i, seed_state = rnd(seed_state, len(tokens))
+            ins = tokens[tok_i]
+            ins_at, seed_state = rnd(seed_state, len(buf) + 1)
+            buf[ins_at:ins_at] = ins
+            if len(buf) > base_len + span:
+                del buf[base_len + span:]  # cap
+
+        elif strat == 9:
+            # endian flip 2/4/8-byte chunk (if available)
+            if len(buf) >= 2:
+                szs = [2,4,8]
+                zidx, seed_state = rnd(seed_state, len(szs))
+                sz = szs[zidx]
+                if len(buf) >= sz:
+                    off, seed_state = rnd(seed_state, len(buf) - sz + 1)
+                    buf[off:off+sz] = buf[off:off+sz][::-1]
+
+        elif strat == 10:
+            # multi-point byte perturbations (few scattered edits)
+            edits = 1 + (it % 4)  # 1..4 edits
+            for _ in range(edits):
+                if not buf: break
+                pos, seed_state = rnd(seed_state, len(buf))
+                val, seed_state = rnd(seed_state, 256)
+                buf[pos] ^= (val & 0xFF)
+
+        # sanitize (replace any disallowed bytes deterministically)
+        buf = sanitize(buf, seed_state)
+
+        # Optional soft terminators (respect avoid_set if present)
+        # newline every 11th iter
+        if (it % 11) == 0 and (0x0A not in getattr(self, "_avoid_set", set())):
+            buf += b"\n"
+        # zero-terminator every 17th iter
+        if (it % 17) == 0 and (0x00 not in getattr(self, "_avoid_set", set())):
+            buf += b"\x00"
+
+        # enforce final cap again
+        if len(buf) > base_len + span:
+            del buf[base_len + span:]
+
+        return bytes(buf)
     # ---- delivery to running PID ----
     def _deliver_to_pid(self, payload: bytes) -> None:
         mode = self.mode
