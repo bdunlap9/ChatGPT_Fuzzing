@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Python 3.9+, Windows only
-import argparse,csv,datetime,json,os,re,sys,socket,time,textwrap,base64
+import argparse, csv, datetime, json, os, re, sys, socket, time, textwrap, base64, hashlib, random
 import ctypes as C
 import ctypes.wintypes as W
 from typing import Dict, List, Optional, Tuple
@@ -323,7 +323,7 @@ def maybe_autoconfig_transport_from_labels(labels: List[str]) -> None:
 # ---------------- Strict overflow classifier ----------------
 class OverflowClassifier:
     """
-    Classifies crashes as probable buffer overflows.
+    Classifies crashes as probable buffer overflows (strong signals).
     Accepts:
       - Windows: 0xC0000409 (STACK_BUFFER_OVERRUN), 0xC0000374 (HEAP_CORRUPTION)
       - Windows: 0xC0000005 (ACCESS_VIOLATION) only when stderr has overflow markers
@@ -339,6 +339,7 @@ class OverflowClassifier:
         r"__fortify_fail",
         r"_security_check_cookie",
         r"stack cookie",
+        r"WER_CRASH_DUMP_DETECTED",
     ]
     _pat = re.compile("|".join(f"(?:{p})" for p in OVERFLOW_STDERR_PATTERNS), re.IGNORECASE)
 
@@ -383,6 +384,200 @@ class OverflowClassifier:
 
         return False, indicators
 
+# ---------------- Heuristic signals (latency / stderr burst / rc sets) ----------------
+class HeuristicSignals:
+    def __init__(self):
+        self.lat_ms = []
+        self.stderr_lens = []
+        self.rc_hist = {}
+
+    def update_and_score(self, *, dt_ms: float, stderr_len: int, rc: Optional[int]) -> Tuple[bool, List[str], float]:
+        reasons = []
+        # update history
+        self.lat_ms.append(dt_ms)
+        self.lat_ms = self.lat_ms[-200:]
+        self.stderr_lens.append(stderr_len)
+        self.stderr_lens = self.stderr_lens[-200:]
+        if rc is not None:
+            self.rc_hist[rc] = self.rc_hist.get(rc, 0) + 1
+            if rc in (3, -1073741819, 0xC0000005):  # generic Windows AV or odd exits
+                reasons.append(f"rc:{rc}")
+
+        # compute z-ish scores
+        def mean(xs): return sum(xs)/len(xs) if xs else 0.0
+        def stdev(xs):
+            if len(xs) < 2: return 0.0
+            m = mean(xs); return (sum((x-m)*(x-m) for x in xs)/ (len(xs)-1))**0.5
+
+        lat_m, lat_s = mean(self.lat_ms), stdev(self.lat_ms)
+        sd_m, sd_s = mean(self.stderr_lens), stdev(self.stderr_lens)
+        z_lat = (dt_ms - lat_m) / (lat_s if lat_s > 1e-6 else 1e9)
+        z_sd  = (stderr_len - sd_m) / (sd_s if sd_s > 1e-6 else 1e9)
+
+        score = max(z_lat, z_sd)
+        if z_lat > 4.0:
+            reasons.append("latency_spike")
+        if z_sd > 4.0:
+            reasons.append("stderr_spike")
+
+        suspicious = bool(reasons)
+        return suspicious, reasons, score
+
+# ---------------- Token harvesting from stderr ----------------
+_token_rgx = re.compile(r"[A-Za-z0-9_]{4,32}")
+def harvest_tokens_from_stderr(stderr: bytes) -> List[bytes]:
+    s = (stderr or b"").decode("utf-8", errors="ignore")
+    toks = set()
+    for m in _token_rgx.findall(s):
+        if m.lower() in ("error","fatal","exception","warning","failed","invalid","stack","heap"):
+            continue
+        toks.add(m.encode("latin-1", "ignore"))
+    return list(toks)
+
+# ---------------- File templates to exercise real parsers ----------------
+def with_file_template(payload: bytes, kind: Optional[str]) -> bytes:
+    if not kind: return payload
+    k = kind.lower()
+    if k == "png":
+        # minimal PNG w/ payload in IDAT
+        return (b"\x89PNG\r\n\x1a\n"
+                b"\x00\x00\x00\rIHDR" + b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00" +
+                b"\x90wS\xde" +
+                b"\x00\x00\x00\x08IDAT" + payload[:1024] +
+                b"\x00\x00\x00\x00IEND\xaeB`\x82")
+    if k == "zip":
+        return b"PK\x03\x04" + payload[:2048]
+    if k == "json":
+        try:
+            s = payload.decode("latin-1","ignore")
+        except:
+            s = str(payload)
+        return ("{\"data\":\"" + s.replace("\\","\\\\").replace("\"","\\\"")[:4000] + "\"}").encode("utf-8","ignore")
+    if k == "xml":
+        return (b"<?xml version='1.0'?><data>" + payload[:4000] + b"</data>")
+    if k == "bmp":
+        body = payload[:4096]
+        header = b"BM" + (14+40+len(body)).to_bytes(4,"little") + b"\x00\x00\x00\x00" + (14+40).to_bytes(4,"little")
+        dib = (40).to_bytes(4,"little")+ (1).to_bytes(4,"little")+ (1).to_bytes(4,"little") + (1).to_bytes(2,"little")+ (24).to_bytes(2,"little") + (0).to_bytes(4,"little")+ len(body).to_bytes(4,"little")+ (2835).to_bytes(4,"little")*2 + (0).to_bytes(4,"little")*2
+        return header+dib+body
+    if k == "wav":
+        body = payload[:4096]
+        return b"RIFF" + (36+len(body)).to_bytes(4,"little") + b"WAVEfmt " + (16).to_bytes(4,"little") + (1).to_bytes(2,"little")+ (1).to_bytes(2,"little") + (8000).to_bytes(4,"little")+ (8000).to_bytes(4,"little")+ (1).to_bytes(2,"little")+ (8).to_bytes(2,"little")+ b"data" + len(body).to_bytes(4,"little") + body
+    return payload
+
+# ---- hashing / normalize helpers ----
+def _sha1(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def _normalize_text_for_bucket(s: str) -> str:
+    # Strip paths, hex pointers, decimal PIDs, timestamps
+    s = re.sub(r"[A-Za-z]:(?:\\[^\\\r\n]+)+", "PATH", s)
+    s = re.sub(r"0x[0-9A-Fa-f]+", "0xADDR", s)
+    s = re.sub(r"\b\d{5,}\b", "NUM", s)
+    s = re.sub(r"\b\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\b", "TIME", s)
+    return "\n".join(s.splitlines()[:12]).strip()
+
+# ---- Crash bucketer ----
+class CrashBucketer:
+    def __init__(self):
+        self._seen = set()
+    def _key(self, rc: Optional[int], stderr: bytes) -> str:
+        s = (stderr or b"").decode("utf-8", errors="ignore")
+        s = _normalize_text_for_bucket(s)
+        return f"{rc}|{_sha1(s.encode('utf-8', 'ignore'))}"
+    def seen_before(self, rc: Optional[int], stderr: bytes) -> bool:
+        k = self._key(rc, stderr)
+        if k in self._seen: return True
+        self._seen.add(k); return False
+
+# ---- Novelty map: black-box "coverage-ish" ----
+class NoveltyMap:
+    def __init__(self):
+        self._keys = set()
+    def _vec(self, *, rc: Optional[int], dt_ms: float, stdout: bytes, stderr: bytes) -> bytes:
+        se = len(stderr or b"")
+        so = len(stdout or b"")
+        rc_mod = (rc or 0) & 0xFF
+        latb = int(max(0, min(9999, dt_ms))) // 10
+        se_b = se // 64
+        so_b = so // 64
+        norm = _normalize_text_for_bucket((stderr or b"").decode("utf-8", "ignore"))
+        lines = norm.splitlines()[:4]
+        fp = _sha1("\n".join(lines).encode("utf-8", "ignore"))[:12]
+        return f"{se_b}:{so_b}:{rc_mod}:{latb}:{fp}".encode()
+    def accept(self, *, rc: Optional[int], dt_ms: float, stdout: bytes, stderr: bytes) -> bool:
+        key = _sha1(self._vec(rc=rc, dt_ms=dt_ms, stdout=stdout, stderr=stderr))
+        if key in self._keys: return False
+        self._keys.add(key); return True
+
+# ---- Corpus manager ----
+class CorpusManager:
+    def __init__(self, root="artifacts/corpus", cap=500):
+        self.root = root; self.cap = cap
+        ensure_outdir(self.root); self._count = 0
+    def save(self, payload: bytes, tag: str = "novel") -> str:
+        self._count += 1
+        if self._count > self.cap: return ""
+        fn = os.path.join(self.root, f"{tag}_{now_stamp()}.bin")
+        with open(fn, "wb") as f: f.write(payload)
+        return fn
+
+# ---- Minimizer ----
+def minimize_payload(payload: bytes, predicate, time_budget_ms: int = 1200) -> bytes:
+    start = time.perf_counter()
+    best = payload
+    # Phase 1: chunk remove
+    step = max(8, len(best)//8)
+    while step >= 8 and (time.perf_counter()-start)*1000 < time_budget_ms:
+        changed = False; i = 0
+        while i < len(best) and (time.perf_counter()-start)*1000 < time_budget_ms:
+            j = min(len(best), i+step)
+            cand = best[:i] + best[j:]
+            if len(cand) >= 1 and predicate(cand):
+                best = cand; changed = True
+            else:
+                i += step
+        if not changed: step //= 2
+    # Phase 2: overwrite windows
+    step = max(4, len(best)//16)
+    for bval in (0x41, 0x00, 0xFF, 0x20):
+        if (time.perf_counter()-start)*1000 >= time_budget_ms: break
+        i = 0
+        while i < len(best) and (time.perf_counter()-start)*1000 < time_budget_ms:
+            j = min(len(best), i+step)
+            cand = bytearray(best)
+            for k in range(i, j): cand[k] = bval
+            cand = bytes(cand)
+            if predicate(cand): best = cand
+            i += step
+    return best
+
+# ---- Length schedule (avoid stuck sizes) ----
+def _length_schedule(iter_idx: int, base_len: int, max_growth: int) -> int:
+    B = [32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512, 768, 1024, 1536, 2048]
+    wave = B[(iter_idx // 7) % len(B)]
+    soft_cap = min(base_len + max_growth, 4096)
+    return max(1, min(soft_cap, wave))
+
+# ---- WER CrashDump watcher ----
+class WerWatcher:
+    def __init__(self, dir_path=None):
+        dir_path = dir_path or os.path.join(os.environ.get("LOCALAPPDATA",""), "CrashDumps")
+        self.dir = dir_path
+        self._seen = set()
+        if self.dir and os.path.isdir(self.dir):
+            for fn in os.listdir(self.dir):
+                self._seen.add(fn)
+    def poll_new(self) -> List[str]:
+        if not self.dir or not os.path.isdir(self.dir): return []
+        out = []
+        for fn in os.listdir(self.dir):
+            if fn in self._seen: continue
+            self._seen.add(fn)
+            if fn.lower().endswith((".dmp",".mdmp")):
+                out.append(os.path.join(self.dir, fn))
+        return out
+
 # ---------------- Repro script builder ----------------
 class ReproScriptBuilder:
     """
@@ -407,7 +602,7 @@ class ReproScriptBuilder:
                      file_arg_index: Optional[int]) -> str:
         return textwrap.dedent(f"""\
         #!/usr/bin/env python3
-        import os, sys, subprocess
+        import os, sys, subprocess, time
 
         TARGET = {json.dumps(target)}
         SURFACE = {json.dumps(surface)}
@@ -430,12 +625,15 @@ class ReproScriptBuilder:
                 max_idx = max(ARG_INDEX, 1)
                 argv = [TARGET] + ["DUMMY"] * max_idx
                 argv[ARG_INDEX] = payload.decode("latin-1", errors="ignore")
+                t0=time.perf_counter()
                 cp = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
             elif SURFACE == "stdin":
+                t0=time.perf_counter()
                 cp = subprocess.run([TARGET], input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
             elif SURFACE == "env":
                 env = env.copy()
                 env["PAYLOAD"] = payload.decode("latin-1", errors="ignore")
+                t0=time.perf_counter()
                 cp = subprocess.run([TARGET], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
             elif SURFACE == "file":
                 if FILE_ARG_INDEX is None:
@@ -446,11 +644,13 @@ class ReproScriptBuilder:
                 max_idx = max(FILE_ARG_INDEX, 1)
                 argv = [TARGET] + ["DUMMY"] * max_idx
                 argv[FILE_ARG_INDEX] = tmp_path
+                t0=time.perf_counter()
                 cp = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
             else:
                 print("[repro] Unknown surface:", SURFACE); sys.exit(2)
 
-            print("[repro] returncode:", cp.returncode)
+            dt_ms = (time.perf_counter()-t0)*1000.0
+            print("[repro] returncode:", cp.returncode, "dt_ms=%.1f" % dt_ms)
             if cp.stdout:
                 print("[repro] --- stdout ---\\n" + cp.stdout.decode("utf-8", errors="replace"))
             if cp.stderr:
@@ -641,7 +841,6 @@ class ProcessImportsInspector:
             try:
                 out.extend(self.enumerate_imports_for_base(m["base"]))
             except Exception:
-                # Non-PE or unreadable; skip quietly
                 pass
         return out
 
@@ -691,7 +890,6 @@ def print_preview(entries: List[Dict], limit: int = 50):
         print(f"    ... +{len(entries) - shown} more")
 
 def get_exe_path_from_pid(pid: int) -> str:
-    # reuse our inspector to resolve the path of the main module (the EXE)
     insp = ProcessImportsInspector(pid)
     try:
         mods = insp.list_modules()
@@ -705,15 +903,16 @@ def get_exe_path_from_pid(pid: int) -> str:
 class FuzzSkeleton:
     """
     Usable fuzzer for spawned targets.
-    - Deterministic, length-bounded mutator
+    - Deterministic, length-bounded mutator + length schedule
     - Simple runner for argv/stdin/env/file
+    - Novelty-driven corpus, crash bucketing, minimizer, heuristics, WER watcher
     """
     def __init__(self, *, target_path: str, surface: str,
                  timeout: float, arg_index: Optional[int],
                  file_arg_index: Optional[int],
                  env_overrides: Dict[str, str],
                  out_dir: str):
-        import subprocess  # local import to avoid unused when not used
+        import subprocess  # local import
         self.subprocess = subprocess
 
         self.target_path = target_path
@@ -724,13 +923,20 @@ class FuzzSkeleton:
         self.env_overrides = env_overrides
         self.out_dir = out_dir
 
-        self.max_growth = 1024
+        self.max_growth = int(os.environ.get("FUZZ_PID_MAX_GROW", "1024"))
         self._avoid_set = set()
+        self.file_template = os.environ.get("FUZZ_FILE_TEMPLATE", None)
 
         self.classifier = OverflowClassifier()
         self.repro = ReproScriptBuilder(out_dir=out_dir)
+        self.crash_buckets = CrashBucketer()
+        self.novelty = NoveltyMap()
+        self.corpus = CorpusManager()
+        self.hsig = HeuristicSignals()
+        self.tokens: List[bytes] = []
+        self.wer = WerWatcher(os.environ.get("FUZZ_WER_DIR"))
 
-    # ---- deterministic mutator (same style as PID skeleton) ----
+    # ---- deterministic mutator ----
     def _mutate(self, seed: bytes, iteration: int) -> bytes:
         def xorshift32(x: int) -> int:
             x ^= (x << 13) & 0xFFFFFFFF
@@ -755,113 +961,120 @@ class FuzzSkeleton:
         s = seed or b"A"
         it = max(0, int(iteration))
         seed_hash = ((len(s) & 0xFFFF) << 16) ^ (it & 0xFFFF) or 0xBEEFCAFE
-        strat = it % 6
+        strat = it % 7
 
         if strat == 0:
-            return bytes(sanitize(bytearray(s), self._avoid_set))
-        if strat == 1:
+            out = bytes(sanitize(bytearray(s), self._avoid_set))
+        elif strat == 1:
             buf = bytearray(s)
-            pos, seed_hash = rnd(seed_hash, len(buf))
-            bit, seed_hash = rnd(seed_hash, 8)
+            pos = (seed_hash % max(1,len(buf)))
+            bit = (seed_hash >> 5) & 7
             buf[pos] ^= (1 << bit)
-            return bytes(sanitize(buf, self._avoid_set))
-        if strat == 2:
+            out = bytes(sanitize(buf, self._avoid_set))
+        elif strat == 2:
             interesting = [0x00,0xFF,0x7F,0x80,0x20,0x0A,0x0D,0x09,0x41,0x61,0x2F,0x5C]
             buf = bytearray(s)
-            pos, seed_hash = rnd(seed_hash, len(buf))
+            pos = seed_hash % max(1,len(buf))
             buf[pos] = interesting[it % len(interesting)]
-            return bytes(sanitize(buf, self._avoid_set))
-        if strat == 3:
+            out = bytes(sanitize(buf, self._avoid_set))
+        elif strat == 3:
             buf = bytearray(s)
             win_len = min(max(2, (it % 7) + 2), max(1, len(buf)))
             start_max = max(1, len(buf) - win_len + 1)
-            start, seed_hash = rnd(seed_hash, start_max)
+            start = seed_hash % start_max
             delta = ((it & 3) - 1)
             for i in range(start, start + win_len):
                 buf[i] = (buf[i] + delta) & 0xFF
-            return bytes(sanitize(buf, self._avoid_set))
-        if strat == 4:
-            cap = min(len(s) + max(16, min(64, len(s) or 64)), len(s) + self.max_growth)
+            out = bytes(sanitize(buf, self._avoid_set))
+        elif strat == 4:
+            cap = min(len(s) + max(16, min(128, len(s) or 64)), len(s) + self.max_growth)
             base = s or b"A"
             rep = (cap + len(base) - 1) // len(base)
             buf = bytearray((base * rep)[:cap])
             if buf:
-                pos, seed_hash = rnd(seed_hash, len(buf))
+                pos = seed_hash % len(buf)
                 buf[pos] = (buf[pos] ^ (it & 0x7F)) & 0xFF
-            return bytes(sanitize(buf, self._avoid_set))
-        mid = len(s) // 2
-        out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
-        return bytes(sanitize(bytearray(out), self._avoid_set))
-    
+            out = bytes(sanitize(buf, self._avoid_set))
+        elif strat == 5 and self.tokens:
+            # splice-in token
+            tok = random.choice(self.tokens)
+            pos = seed_hash % (len(s)+1)
+            out = s[:pos] + tok + s[pos:]
+        else:
+            mid = len(s) // 2
+            out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
+
+        # length schedule bias (prevents plateaus)
+        target_len = _length_schedule(it, len(s), self.max_growth)
+        if len(out) < target_len:
+            out = (out + out[::-1] + b"A"*target_len)[:target_len]
+        elif len(out) > target_len:
+            head = target_len // 2
+            tail = target_len - head
+            out = out[:head] + out[-tail:]
+
+        return bytes(out)
+
     def _choose_surface_for_payload(self, payload: bytes) -> Tuple[str, Optional[int], Optional[int]]:
-        """
-        Decide how to drive the target for THIS payload.
-        Priority:
-        1) argv  (requires --arg-index AND no NUL bytes in payload)
-        2) file  (requires --file-arg-index)
-        3) stdin (fallback)
-        4) env   (only if user explicitly selected it)
-        Returns: (surface, arg_index, file_arg_index)
-        """
         if self.surface != "auto":
             return self.surface, self.arg_index, self.file_arg_index
-
-        # Prefer argv if user provided an index and payload is argv-safe (no NULs)
         if self.arg_index is not None and b"\x00" not in payload:
             return "argv", self.arg_index, None
-
-        # Next best: file if we can pass a path positionally
         if self.file_arg_index is not None:
             return "file", None, self.file_arg_index
-
-        # Safe fallback
         return "stdin", None, None
 
     # ---- runner for spawned process ----
-    def _execute(self, payload: bytes) -> Tuple[int, bytes, bytes]:
+    def _execute(self, payload: bytes) -> Tuple[int, bytes, bytes, float]:
         env = os.environ.copy()
         env.update(self.env_overrides or {})
 
         chosen_surface, arg_idx, file_idx = self._choose_surface_for_payload(payload)
-        # Tiny trace to understand choices during runs
-        if self.surface == "auto":
-            print(f"[fuzz:auto] chose surface={chosen_surface} (arg_index={arg_idx}, file_arg_index={file_idx})")
-
         if chosen_surface == "argv":
             if arg_idx is None:
                 raise ValueError("argv surface requires --arg-index (auto)")
             max_idx = max(arg_idx, 1)
             argv = [self.target_path] + ["DUMMY"] * max_idx
             argv[arg_idx] = payload.decode("latin-1", errors="ignore")
+            t0 = time.perf_counter()
             cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                    env=env, timeout=self.timeout)
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
+                                     env=env, timeout=self.timeout)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
 
         if chosen_surface == "stdin":
+            t0 = time.perf_counter()
             cp = self.subprocess.run([self.target_path], input=payload,
-                                    stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                    env=env, timeout=self.timeout)
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
+                                     stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                     env=env, timeout=self.timeout)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
 
         if chosen_surface == "env":
             env2 = env.copy()
             env2["PAYLOAD"] = payload.decode("latin-1", errors="ignore")
+            t0 = time.perf_counter()
             cp = self.subprocess.run([self.target_path], stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                    env=env2, timeout=self.timeout)
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
+                                     env=env2, timeout=self.timeout)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
 
         if chosen_surface == "file":
             if file_idx is None:
                 raise ValueError("file surface requires --file-arg-index (auto)")
             tmp = os.path.join(self.out_dir, f"input_{now_stamp()}.dat")
+            # apply optional template
+            to_write = with_file_template(payload, self.file_template)
             with open(tmp, "wb") as f:
-                f.write(payload)
+                f.write(to_write)
             max_idx = max(file_idx, 1)
             argv = [self.target_path] + ["DUMMY"] * max_idx
             argv[file_idx] = tmp
+            t0 = time.perf_counter()
             cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                    env=env, timeout=self.timeout)
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b""
+                                     env=env, timeout=self.timeout)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
 
         raise ValueError(f"unknown surface: {chosen_surface}")
 
@@ -884,29 +1097,94 @@ class FuzzSkeleton:
                     continue
 
                 try:
-                    rc, stdout, stderr = self._execute(payload)
+                    rc, stdout, stderr, dt_ms = self._execute(payload)
                 except Exception as e:
-                    # includes subprocess.TimeoutExpired and other spawn errors
                     print(f"[fuzz] execution error at iter {it}: {e}")
                     continue
 
-                probable, indicators = self.classifier.classify(rc, stderr)
-                if probable:
-                    print("\n=== PROBABLE BUFFER OVERFLOW (spawned skeleton) ===")
-                    print("Indicators:", ", ".join(indicators))
-                    paths = self.repro.build_and_optionally_run(
-                        target_path=self.target_path,
-                        surface=self.surface,
-                        payload=payload,
-                        timeout=self.timeout,
-                        arg_index=self.arg_index,
-                        env_overrides=self.env_overrides,
-                        file_arg_index=self.file_arg_index,
-                        run_after_write=True
-                    )
-                    print("[fuzz] Repro bundle:", json.dumps(paths, indent=2))
-                    print("[fuzz] Stopping after first overflow (skeleton behavior).")
-                    return
+                # WER crashdump watcher
+                wer_new = self.wer.poll_new()
+                if wer_new:
+                    print(f"[wer] new crash dumps detected: {len(wer_new)}")
+                    stderr = (stderr or b"") + b"\nWER_CRASH_DUMP_DETECTED\n"
+
+                # token harvest from stderr
+                new_toks = harvest_tokens_from_stderr(stderr)
+                for t in new_toks:
+                    if t not in self.tokens:
+                        self.tokens.append(t)
+                if new_toks:
+                    print(f"[dict] harvested {len(new_toks)} tokens from stderr (total {len(self.tokens)})")
+
+                # novelty -> corpus
+                if self.novelty.accept(rc=rc, dt_ms=dt_ms, stdout=stdout, stderr=stderr):
+                    saved = self.corpus.save(payload, tag="novel")
+                    if saved:
+                        print(f"[corpus] novel behavior -> saved {saved}")
+
+                # heuristics
+                suspicious, h_reasons, h_score = self.hsig.update_and_score(
+                    dt_ms=dt_ms, stderr_len=len(stderr or b""), rc=rc
+                )
+
+                # classification (strong) + optional promotion
+                is_overflow, indicators = self.classifier.classify(rc, stderr)
+                crashed = is_overflow
+                if not crashed and os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1" and suspicious:
+                    crashed = True
+                    indicators = (indicators or []) + [f"heur:{'+'.join(h_reasons)}"]
+
+                if not crashed:
+                    continue
+
+                # bucket suppression
+                if self.crash_buckets.seen_before(rc, stderr):
+                    print("[crash] duplicate bucket; skipping repro bundle")
+                    continue
+
+                # minimization
+                do_min = os.environ.get("FUZZ_MINIMIZE", "1") == "1"
+                min_ms = int(os.environ.get("FUZZ_MINIMIZE_BUDGET_MS", "1200"))
+                if do_min:
+                    def pred(b: bytes) -> bool:
+                        try:
+                            rc2, so2, se2, _dt = self._execute(b)
+                        except Exception:
+                            return False
+                        ok2, _ = self.classifier.classify(rc2, se2)
+                        if ok2:
+                            return True
+                        if os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1":
+                            suspicious2, _r, _s = self.hsig.update_and_score(
+                                dt_ms=_dt, stderr_len=len(se2 or b""), rc=rc2
+                            )
+                            return suspicious2
+                        return False
+                    payload_min = minimize_payload(payload, pred, time_budget_ms=min_ms)
+                    if len(payload_min) < len(payload):
+                        print(f"[min] shrank payload {len(payload)} -> {len(payload_min)} bytes")
+                        payload = payload_min
+
+                # save crash payload
+                saved = self.corpus.save(payload, tag="crash")
+                if saved:
+                    print(f"[crash] saved payload -> {saved}")
+
+                print("\n=== PROBABLE VULN (spawned) ===")
+                print("Indicators:", ", ".join(indicators))
+                paths = self.repro.build_and_optionally_run(
+                    target_path=self.target_path,
+                    surface=self.surface,
+                    payload=payload,
+                    timeout=self.timeout,
+                    arg_index=self.arg_index,
+                    env_overrides=self.env_overrides,
+                    file_arg_index=self.file_arg_index,
+                    run_after_write=True
+                )
+                print("[fuzz] Repro bundle:", json.dumps(paths, indent=2))
+                print("[fuzz] Stopping after first positive (skeleton behavior).")
+                return
 
         print("[fuzz] Completed without detecting probable buffer overflows.")
 
@@ -915,11 +1193,7 @@ class FuzzSkeletonPID:
     """
     Safe, non-operational-by-default skeleton that attaches to a running PID (read-only)
     and delivers payloads via opt-in transports (noop/file/tcp/pipe). No injection or RPM writes.
-
-    Implemented surfaces: delivery to external endpoints you manage; we only *classify*
-    outcomes using a monitor log.
     """
-
     def __init__(self, *, pid: int, target_path_for_repro: str, surface: str,
                  timeout: float,
                  arg_index: Optional[int],
@@ -933,26 +1207,24 @@ class FuzzSkeletonPID:
         self.file_arg_index = file_arg_index
         self.env_overrides = env_overrides
         self.out_dir = out_dir
-        self.target_path_for_repro = target_path_for_repro  # for repro script
+        self.target_path_for_repro = target_path_for_repro
 
-        # Transport/monitor configuration via environment variables (no CLI changes needed)
+        # Transport/monitor configuration via environment variables
         self.mode = (os.environ.get("FUZZ_PID_MODE", "noop") or "noop").strip().lower()
         self.drop_dir = (os.environ.get("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries")) or "").strip() or os.path.join("artifacts", "deliveries")
         self.tcp_addr = (os.environ.get("FUZZ_PID_TCP_ADDR", "127.0.0.1") or "127.0.0.1").strip()
         self.tcp_port = int((os.environ.get("FUZZ_PID_TCP_PORT", "0") or "0").strip() or "0")
         self.pipe_name = (os.environ.get("FUZZ_PID_PIPE_NAME", "") or "").strip() or None
         self.monitor_log = (os.environ.get("FUZZ_PID_MONITOR_LOG", "") or "").strip() or None
-
-        self.max_growth = int((os.environ.get("FUZZ_PID_MAX_GROW", "1024") or "1024").strip())
-        self.avoid_hex  = (os.environ.get("FUZZ_PID_AVOID_HEX", "") or "").strip()
+        self.file_template = os.environ.get("FUZZ_FILE_TEMPLATE", None)
 
         ensure_outdir(self.drop_dir)
 
         # Mutation & log-tail config (env overrides)
-        self.max_growth = int(os.environ.get("FUZZ_PID_MAX_GROW", "1024"))  # cap extension per iter
-        self.avoid_hex  = os.environ.get("FUZZ_PID_AVOID_HEX", "")          # e.g. "00,0a,0d"
+        self.max_growth = int(os.environ.get("FUZZ_PID_MAX_GROW", "1024"))
+        self.avoid_hex  = os.environ.get("FUZZ_PID_AVOID_HEX", "")
         self._avoid_set = {int(t, 16) & 0xFF for t in re.split(r"[,\s]+", self.avoid_hex) if t} if self.avoid_hex else set()
-        self._log_pos: int = 0  # rolling file offset for incremental tailing
+        self._log_pos: int = 0
 
         # Attach read-only to the process (metadata only)
         access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
@@ -962,38 +1234,32 @@ class FuzzSkeletonPID:
 
         self.classifier = OverflowClassifier()
         self.repro = ReproScriptBuilder(out_dir=out_dir)
+        self.crash_buckets = CrashBucketer()
+        self.novelty = NoveltyMap()
+        self.corpus = CorpusManager()
+        self.hsig = HeuristicSignals()
+        self.tokens: List[bytes] = []
+        self.wer = WerWatcher(os.environ.get("FUZZ_WER_DIR"))
 
     def close(self):
         if self.hProcess:
             CloseHandle(self.hProcess)
             self.hProcess = None
 
-    # ----------------- IMPROVED: deterministic mutator -----------------
+    # ---- deterministic mutator (same ideas as spawn) ----
     def _mutate(self, seed: bytes, iteration: int) -> bytes:
-        """
-        Deterministic, length-bounded, byte-safe mutations.
-          0: identity
-          1: single-bit flip
-          2: single-byte overwrite with interesting values
-          3: arithmetic +/- on a sliding window
-          4: bounded repeat/extend (capped by self.max_growth)
-          5: splice: head + reversed tail
-        Honors FUZZ_PID_AVOID_HEX to scrub disallowed bytes.
-        """
         def xorshift32(x: int) -> int:
             x ^= (x << 13) & 0xFFFFFFFF
             x ^= (x >> 17) & 0xFFFFFFFF
             x ^= (x << 5)  & 0xFFFFFFFF
             return x & 0xFFFFFFFF
-
         def rnd(state: int, mod: int) -> (int, int):
             state = xorshift32(state)
             return (state % max(1, mod)), state
-
         def sanitize(buf: bytearray) -> bytearray:
             if not self._avoid_set:
                 return buf
-            st = seed_hash
+            st = 0xDEADBEEF
             for i, b in enumerate(buf):
                 if b in self._avoid_set:
                     idx, st = rnd(st, 256)
@@ -1007,59 +1273,60 @@ class FuzzSkeletonPID:
 
         s = seed or b"A"
         it = max(0, int(iteration))
-        seed_hash = ((len(s) & 0xFFFF) << 16) ^ (it & 0xFFFF) or 0xDEADBEEF
-        strat = it % 6
+        strat = it % 7
 
         if strat == 0:
-            return bytes(sanitize(bytearray(s)))
-
-        if strat == 1:
+            out = bytes(sanitize(bytearray(s)))
+        elif strat == 1:
             buf = bytearray(s)
-            pos, seed_hash = rnd(seed_hash, len(buf))
-            bit, seed_hash = rnd(seed_hash, 8)
+            pos = (len(buf) and (it % len(buf))) or 0
+            bit = (it >> 5) & 7
             buf[pos] ^= (1 << bit)
-            return bytes(sanitize(buf))
-
-        if strat == 2:
+            out = bytes(sanitize(buf))
+        elif strat == 2:
             interesting = [0x00,0xFF,0x7F,0x80,0x20,0x0A,0x0D,0x09,0x41,0x61,0x2F,0x5C]
             buf = bytearray(s)
-            pos, seed_hash = rnd(seed_hash, len(buf))
+            pos = (len(buf) and (it % len(buf))) or 0
             buf[pos] = interesting[it % len(interesting)]
-            return bytes(sanitize(buf))
-
-        if strat == 3:
+            out = bytes(sanitize(buf))
+        elif strat == 3:
             buf = bytearray(s)
             win_len = min(max(2, (it % 7) + 2), max(1, len(buf)))
             start_max = max(1, len(buf) - win_len + 1)
-            start, seed_hash = rnd(seed_hash, start_max)
-            delta = ((it & 3) - 1)  # -1,0,1,2
+            start = it % start_max
+            delta = ((it & 3) - 1)
             for i in range(start, start + win_len):
                 buf[i] = (buf[i] + delta) & 0xFF
-            return bytes(sanitize(buf))
-
-        if strat == 4:
-            cap = min(len(s) + max(16, min(64, len(s) or 64)), len(s) + self.max_growth)
+            out = bytes(sanitize(buf))
+        elif strat == 4:
+            cap = min(len(s) + max(16, min(128, len(s) or 64)), len(s) + self.max_growth)
             base = s or b"A"
             rep = (cap + len(base) - 1) // len(base)
             buf = bytearray((base * rep)[:cap])
             if buf:
-                pos, seed_hash = rnd(seed_hash, len(buf))
+                pos = it % len(buf)
                 buf[pos] = (buf[pos] ^ (it & 0x7F)) & 0xFF
-            return bytes(sanitize(buf))
+            out = bytes(sanitize(buf))
+        elif strat == 5 and self.tokens:
+            tok = random.choice(self.tokens)
+            pos = (len(s)+1) and (it % (len(s)+1))
+            out = s[:pos] + tok + s[pos:]
+        else:
+            mid = len(s) // 2
+            out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
 
-        mid = len(s) // 2
-        out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
-        return bytes(sanitize(bytearray(out)))
+        target_len = _length_schedule(it, len(s), self.max_growth)
+        if len(out) < target_len:
+            out = (out + out[::-1] + b"A"*target_len)[:target_len]
+        elif len(out) > target_len:
+            head = target_len // 2
+            tail = target_len - head
+            out = out[:head] + out[-tail:]
 
-    # ----------------- IMPROVED: delivery to running PID -----------------
+        return bytes(out)
+
+    # ---- delivery to running PID ----
     def _deliver_to_pid(self, payload: bytes) -> None:
-        """
-        Delivery modes:
-          - noop : do nothing
-          - file : write artifacts/deliveries/payload_<ts>.bin (+ .meta.json)
-          - tcp  : send to FUZZ_PID_TCP_ADDR:FUZZ_PID_TCP_PORT (with optional newline)
-          - pipe : WaitNamedPipeW + CreateFileW + WriteFile to FUZZ_PID_PIPE_NAME
-        """
         mode = self.mode
 
         if mode == "noop":
@@ -1069,10 +1336,11 @@ class FuzzSkeletonPID:
         if mode == "file":
             stamp = now_stamp()
             out_path = os.path.join(self.drop_dir, f"payload_{stamp}.bin")
+            to_write = with_file_template(payload, self.file_template)
             with open(out_path, "wb") as f:
-                f.write(payload)
+                f.write(to_write)
             with open(out_path + ".meta.json", "w", encoding="utf-8") as mf:
-                json.dump({"pid": self.pid, "bytes": len(payload), "timestamp": stamp, "surface": self.surface}, mf, indent=2)
+                json.dump({"pid": self.pid, "bytes": len(to_write), "timestamp": stamp, "surface": self.surface}, mf, indent=2)
             print(f"[fuzz-pid] (file) wrote payload -> {out_path}")
             return
 
@@ -1100,7 +1368,7 @@ class FuzzSkeletonPID:
                 raise RuntimeError("FUZZ_PID_PIPE_NAME is required for pipe mode, e.g. \\\\.\\pipe\\MyPipe")
             wait_ms = int(float(os.environ.get("FUZZ_PID_PIPE_WAIT_MS", str(int(self.timeout * 1000)))) or 0)
             if wait_ms > 0:
-                WaitNamedPipeW(self.pipe_name, wait_ms)  # best-effort
+                WaitNamedPipeW(self.pipe_name, wait_ms)
             h = CreateFileW(self.pipe_name, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
             if int(h) == 0 or int(h) == INVALID_HANDLE_VALUE:
                 _raise_last_error(f"CreateFileW on pipe failed: {self.pipe_name}")
@@ -1116,13 +1384,8 @@ class FuzzSkeletonPID:
 
         raise ValueError(f"Unknown FUZZ_PID_MODE='{mode}' (expected noop|file|tcp|pipe)")
 
-    # ----------------- IMPROVED: incremental signal collection -----------------
+    # ---- incremental signal collection ----
     def _collect_signals(self) -> Tuple[Optional[int], bytes]:
-        """
-        We did not spawn the process; return_code is None.
-        If FUZZ_PID_MONITOR_LOG is set, return only NEW bytes since last read.
-        Handles rotation (truncate -> resets offset).
-        """
         rc: Optional[int] = None
         log_path = self.monitor_log
         if not log_path:
@@ -1134,7 +1397,7 @@ class FuzzSkeletonPID:
 
         try:
             size = p.stat().st_size
-            if self._log_pos > size:  # rotation/truncation
+            if self._log_pos > size:
                 self._log_pos = 0
             with p.open("rb") as f:
                 f.seek(self._log_pos, os.SEEK_SET)
@@ -1144,10 +1407,10 @@ class FuzzSkeletonPID:
             print(f"[fuzz-pid] monitor read failed: {e}")
             data = b""
 
-        time.sleep(min(0.02, max(0.0, self.timeout / 200.0)))  # tiny cooldown
+        time.sleep(min(0.02, max(0.0, self.timeout / 200.0)))
         return rc, data
 
-    # ----------------- Orchestrator -----------------
+    # ---- orchestrator ----
     def run(self, seeds: List[bytes], max_iters: int) -> None:
         try:
             if not seeds:
@@ -1165,29 +1428,94 @@ class FuzzSkeletonPID:
                         continue
 
                     try:
+                        t0 = time.perf_counter()
                         self._deliver_to_pid(payload)
+                        rc, stderr = self._collect_signals()
+                        dt_ms = (time.perf_counter() - t0) * 1000.0
+                        stdout = b""
                     except Exception as e:
                         print(f"[fuzz-pid] delivery error at iter {it}: {e}")
                         continue
 
-                    rc, stderr = self._collect_signals()
+                    # WER crashdump watcher
+                    wer_new = self.wer.poll_new()
+                    if wer_new:
+                        print(f"[wer] new crash dumps detected: {len(wer_new)}")
+                        stderr = (stderr or b"") + b"\nWER_CRASH_DUMP_DETECTED\n"
+
+                    # token harvest
+                    new_toks = harvest_tokens_from_stderr(stderr)
+                    for t in new_toks:
+                        if t not in self.tokens:
+                            self.tokens.append(t)
+                    if new_toks:
+                        print(f"[dict] harvested {len(new_toks)} tokens from stderr (total {len(self.tokens)})")
+
+                    # novelty -> corpus
+                    if self.novelty.accept(rc=rc, dt_ms=dt_ms, stdout=stdout, stderr=stderr):
+                        saved = self.corpus.save(payload, tag="novel")
+                        if saved:
+                            print(f"[corpus] novel behavior -> saved {saved}")
+
+                    # heuristics
+                    suspicious, h_reasons, h_score = self.hsig.update_and_score(
+                        dt_ms=dt_ms, stderr_len=len(stderr or b""), rc=rc
+                    )
+
+                    # classification + promotion
                     is_overflow, indicators = self.classifier.classify(rc, stderr)
-                    if is_overflow:
-                        print("\n=== PROBABLE BUFFER OVERFLOW (PID skeleton) ===")
-                        print("Indicators:", ", ".join(indicators))
-                        paths = self.repro.build_and_optionally_run(
-                            target_path=self.target_path_for_repro,
-                            surface=self.surface,
-                            payload=payload,
-                            timeout=self.timeout,
-                            arg_index=self.arg_index,
-                            env_overrides=self.env_overrides,
-                            file_arg_index=self.file_arg_index,
-                            run_after_write=True
-                        )
-                        print("[fuzz-pid] Repro bundle:", json.dumps(paths, indent=2))
-                        print("[fuzz-pid] Stopping after first overflow (skeleton behavior).")
-                        return
+                    crashed = is_overflow
+                    if not crashed and os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1" and suspicious:
+                        crashed = True
+                        indicators = (indicators or []) + [f"heur:{'+'.join(h_reasons)}"]
+
+                    if not crashed:
+                        continue
+
+                    if self.crash_buckets.seen_before(rc, stderr):
+                        print("[crash] duplicate bucket; skipping repro bundle")
+                        continue
+
+                    # minimization (heuristic in PID mode)
+                    do_min = os.environ.get("FUZZ_MINIMIZE", "1") == "1"
+                    min_ms = int(os.environ.get("FUZZ_MINIMIZE_BUDGET_MS", "1200"))
+                    if do_min:
+                        def pred(b: bytes) -> bool:
+                            t0m = time.perf_counter()
+                            try:
+                                self._deliver_to_pid(b)
+                            except Exception:
+                                return False
+                            rc2, se2 = self._collect_signals()
+                            dt2 = (time.perf_counter() - t0m) * 1000.0
+                            ok2, _ = self.classifier.classify(rc2, se2)
+                            if ok2: return True
+                            susp2, _r, _s = self.hsig.update_and_score(dt_ms=dt2, stderr_len=len(se2 or b""), rc=rc2)
+                            return susp2
+                        payload_min = minimize_payload(payload, pred, time_budget_ms=min_ms)
+                        if len(payload_min) < len(payload):
+                            print(f"[min] shrank payload {len(payload)} -> {len(payload_min)} bytes")
+                            payload = payload_min
+
+                    saved = self.corpus.save(payload, tag="crash")
+                    if saved:
+                        print(f"[crash] saved payload -> {saved}")
+
+                    print("\n=== PROBABLE VULN (PID) ===")
+                    print("Indicators:", ", ".join(indicators))
+                    paths = self.repro.build_and_optionally_run(
+                        target_path=self.target_path_for_repro,
+                        surface=self.surface,
+                        payload=payload,
+                        timeout=self.timeout,
+                        arg_index=self.arg_index,
+                        env_overrides=self.env_overrides,
+                        file_arg_index=self.file_arg_index,
+                        run_after_write=True
+                    )
+                    print("[fuzz-pid] Repro bundle:", json.dumps(paths, indent=2))
+                    print("[fuzz-pid] Stopping after first positive (skeleton behavior).")
+                    return
 
             print("[fuzz-pid] Completed without detecting probable buffer overflows.")
         finally:
@@ -1221,6 +1549,8 @@ def parse_args():
     pr.add_argument("--rc", type=int, required=True, help="Process return code from the run")
     pr.add_argument("--stderr", required=True, help="Path to captured stderr file")
     pr.add_argument("--target", required=True, help="Target binary path for the reproducer")
+    pr.add_argument("--surface", choices=["argv", "stdin", "env", "file"], required=True,
+                    help="Surface used when the overflow occurred")
     pr.add_argument("--payload-bin", required=True, help="Path to the exact payload bytes that triggered the issue")
     pr.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds for repro")
     pr.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
@@ -1229,12 +1559,13 @@ def parse_args():
     pr.add_argument("--out-dir", default="crashes", help="Output directory for payload & repro")
     pr.add_argument("--no-rerun", action="store_true", help="Do not auto-execute the reproducer once")
 
-    # fuzz-skeleton (spawn a new process). Allow either a path or resolve from a PID.
+    # fuzz-skeleton (spawn)
     pf = sub.add_parser("fuzz-skeleton", help="Spawned-process fuzzing skeleton")
     tgt = pf.add_mutually_exclusive_group(required=True)
     tgt.add_argument("--target", help="Path to target binary (for repro bundles)")
     tgt.add_argument("--target-pid", type=int, help="Resolve the EXE path from this running PID")
-    pf.add_argument("--surface", choices=["auto", "argv", "stdin", "env", "file"], default="auto", help="Surface to fuzz; 'auto' chooses argv (if possible, no NULs and --arg-index), else file (if --file-arg-index), else stdin (default: auto)")
+    pf.add_argument("--surface", choices=["auto", "argv", "stdin", "env", "file"], default="auto",
+                    help="Surface to fuzz; 'auto' chooses argv (if possible, no NULs and --arg-index), else file (if --file-arg-index), else stdin")
     pf.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
     pf.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv")
     pf.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file")
@@ -1247,13 +1578,12 @@ def parse_args():
     pf.add_argument("--ack-permission", action="store_true",
                     help="Acknowledges you have explicit permission to test this target (required)")
 
-    # fuzz-skeleton-pid (attach to a running process; deliver via file/tcp/pipe)
+    # fuzz-skeleton-pid (attach; deliver via file/tcp/pipe)
     pfp = sub.add_parser("fuzz-skeleton-pid", help="PID fuzzing skeleton (attach to running process)")
     pfp.add_argument("--pid", type=int, required=True, help="Running process PID to target (read-only attach)")
     pfp.add_argument("--target", required=True, help="Path to target binary (only for building repro bundles)")
-
-    # fuzz-skeleton-pid (attach to a running process; deliver via file/tcp/pipe)
-    pfp.add_argument("--surface",choices=["auto", "argv", "stdin", "env", "file"],default="auto",help="Semantic surface for repro bundles; 'auto' prefers argv (if possible), else file (if --file-arg-index), else stdin)")
+    pfp.add_argument("--surface", choices=["auto", "argv", "stdin", "env", "file"], default="auto",
+                     help="Semantic surface for repro bundles; 'auto' prefers argv (if possible), else file (if --file-arg-index), else stdin")
     pfp.add_argument("--timeout", type=float, default=2.0, help="Timeout seconds (used in repro bundles)")
     pfp.add_argument("--arg-index", type=int, default=None, help="argv index when surface=argv (repro hint)")
     pfp.add_argument("--file-arg-index", type=int, default=None, help="argv index where file path is placed when surface=file (repro hint)")
