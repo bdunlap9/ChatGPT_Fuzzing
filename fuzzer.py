@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
-import asyncio
-import sys
-import os
-import argparse
-import random
-import string
-import datetime
-import json
+import asyncio, sys, os, argparse, random, string, datetime, json, contextlib, re, platform
 from typing import List, Tuple, Dict, Optional
-import contextlib
-import re
-import platform
 
 # --- Optional cyclic pattern (pwntools) with safe fallback ---
 try:
