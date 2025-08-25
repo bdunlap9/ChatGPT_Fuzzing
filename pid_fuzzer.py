@@ -6,6 +6,62 @@ import ctypes.wintypes as W
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
+_URL_SCHEMES = [b"http", b"https", b"ftp", b"file"]
+_URL_HOSTS   = [b"localhost", b"127.0.0.1", b"[::1]"]
+_URL_PATHS   = [b"/", b"/%2e%2e/", b"/../../", b"/A"*64, b"/%00", b"/..%2f..%2f", b"/index.html"]
+_METHODS     = [b"GET", b"POST", b"PUT", b"PATCH", b"DELETE", b"HEAD", b"OPTIONS"]
+_FLAGS_LIKE  = [b"-v", b"-i", b"-k", b"--tlsv1.0", b"--tls-max", b"--limit-rate", b"--proxy", b"--header", b"--data", b"--path-as-is", b"--output", b"-sS", b"--resolve", b"--url"]
+_INT_EDGES   = [b"0", b"1", b"2", b"7", b"8", b"9", b"10", b"15", b"16", b"31", b"32", b"63", b"64", b"127", b"128", b"255", b"256", b"1024", b"4095", b"4096", b"8191", b"8192"]
+_HDR_KEYS    = [b"Host", b"User-Agent", b"Accept", b"Cookie", b"Range", b"If-Modified-Since", b"Referer", b"Accept-Encoding"]
+
+def _rand_from(seq):
+    return seq[random.randrange(len(seq))]
+
+def _mk_url(seed_hash:int)->bytes:
+    sch  = _rand_from(_URL_SCHEMES)
+    host = _rand_from(_URL_HOSTS)
+    path = _rand_from(_URL_PATHS)
+    q    = b"?q=" + (b"A" * ((seed_hash % 16)+1))
+    return sch + b"://" + host + path + q
+
+def _mk_header(seed_hash:int)->bytes:
+    k = _rand_from(_HDR_KEYS)
+    v = b"A" * ((seed_hash % 48) + 1)
+    return k + b": " + v
+
+def _looks_like_cli(s: bytes)->bool:
+    # heuristic: is your pre/post args full of dashes or does stderr mention usage?
+    return True
+
+def _splice_weighted(base: bytes, dict_tokens: list, seed_hash:int)->bytes:
+    if not dict_tokens:
+        return base
+    # weight longer / rarer tokens a bit more
+    pool = []
+    seen = {}
+    for t in dict_tokens:
+        L = max(1, len(t))
+        seen[L] = seen.get(L, 0) + 1
+    for t in dict_tokens:
+        w = max(1, len(t) // 8) + (1 if t.startswith(b"--") else 0)
+        pool.extend([t] * min(8, w))
+    tok = _rand_from(pool)
+    pos = seed_hash % (len(base)+1)
+    return base[:pos] + tok + base[pos:]
+
+def _mk_cli_like_payload(seed_hash:int)->bytes:
+    strat = seed_hash % 5
+    if strat == 0:  # URL
+        return _mk_url(seed_hash)
+    if strat == 1:  # method + URL
+        return _rand_from(_METHODS) + b" " + _mk_url(seed_hash)
+    if strat == 2:  # flag + int edge
+        return _rand_from(_FLAGS_LIKE) + b" " + _rand_from(_INT_EDGES)
+    if strat == 3:  # header
+        return _mk_header(seed_hash)
+    # mixed
+    return _rand_from(_FLAGS_LIKE) + b" " + _mk_header(seed_hash)
+
 # ---- Win32 constants / DLLs ----
 PROCESS_VM_READ                   = 0x0010
 PROCESS_VM_WRITE                  = 0x0020
@@ -355,34 +411,30 @@ class OverflowClassifier:
             return None
         return rc & 0xFFFFFFFF
 
-    def classify(self, return_code: Optional[int], stderr_bytes: bytes) -> Tuple[bool, List[str]]:
-        s = (stderr_bytes or b"").decode("utf-8", errors="ignore")
-        markers = bool(self._pat.search(s))
-        indicators: List[str] = []
-        if markers:
-            indicators.append("stderr:overflow_markers")
+    def classify(self, rc: Optional[int], stderr: bytes) -> (bool, list):
+        inds = []
+        se = (stderr or b"").lower()
 
-        status = self._win_status(return_code)
-        if status == 0xC0000409:
-            indicators.append("ntstatus:STACK_BUFFER_OVERRUN")
-            return True, indicators
-        if status == 0xC0000374:
-            indicators.append("ntstatus:HEAP_CORRUPTION")
-            return True, indicators
-        if status == 0xC0000005 and markers:
-            indicators.append("ntstatus:ACCESS_VIOLATION+markers")
-            return True, indicators
+        # Windows FAST_FAIL / stack cookie / GS failure
+        if b"fast_fail" in se or b"stack buffer overrun" in se or b"gsfailure" in se \
+           or b"__report_gsfailure" in se or b"c0000409" in se:
+            inds.append("win:fast_fail_stack_cookie")
 
-        sig = self._posix_signal(return_code)
-        if sig in (11, 7, 6) and markers:
-            indicators.append(f"posix_signal:{sig}+markers")
-            return True, indicators
+        # Access violations and similar
+        if b"c0000005" in se or b"access violation" in se:
+            inds.append("win:access_violation")
 
-        if markers and (status is None or status == 0):
-            indicators.append("asan_text_only")
-            return True, indicators
+        # UCRT aborts / invalid parameter / abort()
+        if b"invalid parameter" in se or b"abort()" in se or b"ucrtbase" in se:
+            inds.append("ucrt:invalid_param")
 
-        return False, indicators
+        # Non-zero RC sometimes signals fault on Windows; keep, but be conservative
+        if rc is None:
+            inds.append("timeout")
+        elif isinstance(rc, int) and rc != 0:
+            inds.append(f"rc:{rc}")
+
+        return (len(inds) > 0), inds
 
 # ---------------- Heuristic signals (latency / stderr burst / rc sets) ----------------
 class HeuristicSignals:
@@ -596,60 +648,88 @@ class ReproScriptBuilder:
             f.write(payload.decode("latin-1", errors="replace"))
         return bin_path, txt_path
 
-    def _script_body(self, target: str, surface: str, payload_bin: str,
-                     timeout: Optional[float], arg_index: Optional[int],
-                     env_overrides: Optional[Dict[str, str]],
-                     file_arg_index: Optional[int]) -> str:
+    def _script_body(self, target: str, surface: str, payload_bin: str, timeout: Optional[float], arg_index: Optional[int], env_overrides: Optional[Dict[str, str]], file_arg_index: Optional[int]) -> str:
         return textwrap.dedent(f"""\
         #!/usr/bin/env python3
         import os, sys, subprocess, time
 
-        TARGET = {json.dumps(target)}
+        # Absolute paths (pre-resolved by builder)
+        TARGET = {json.dumps(os.path.abspath(target))}
         SURFACE = {json.dumps(surface)}
-        PAYLOAD_BIN = {json.dumps(payload_bin)}
+        PAYLOAD_BIN = {json.dumps(os.path.abspath(payload_bin))}
         TIMEOUT = {repr(timeout) if timeout is not None else 'None'}
         ARG_INDEX = {arg_index if arg_index is not None else 'None'}
         FILE_ARG_INDEX = {file_arg_index if file_arg_index is not None else 'None'}
         ENV_OVERRIDES = {json.dumps(env_overrides or {})}
 
+        def _resolve_surface():
+            # Convert 'auto' to a concrete surface so the script always runs
+            if SURFACE != "auto":
+                return SURFACE
+            if ARG_INDEX is not None and ARG_INDEX >= 1:
+                return "argv"
+            if FILE_ARG_INDEX is not None and FILE_ARG_INDEX >= 1:
+                return "file"
+            return "stdin"
+
+        def _safe_arg_index():
+            # For Windows + subprocess lists, argv[0] must be the program path.
+            # If the repro was recorded with ARG_INDEX=0 by mistake, bump to 1.
+            if ARG_INDEX is None: return None
+            return 1 if ARG_INDEX < 1 else ARG_INDEX
+
         def main():
+            # Work from the script directory so relative outputs land here
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            if script_dir:
+                os.chdir(script_dir)
+
             with open(PAYLOAD_BIN, "rb") as f:
                 payload = f.read()
 
             env = os.environ.copy()
             env.update(ENV_OVERRIDES or {{}})
 
-            if SURFACE == "argv":
-                if ARG_INDEX is None:
+            surface = _resolve_surface()
+
+            if surface == "argv":
+                idx = _safe_arg_index()
+                if idx is None:
                     print("[repro] ARG_INDEX required for argv"); sys.exit(2)
-                max_idx = max(ARG_INDEX, 1)
-                argv = [TARGET] + ["DUMMY"] * max_idx
-                argv[ARG_INDEX] = payload.decode("latin-1", errors="ignore")
-                t0=time.perf_counter()
+                # Build argv list with placeholders up to idx
+                argv = [TARGET] + ["DUMMY"] * idx
+                argv[idx] = payload.decode("latin-1", errors="ignore")
+                t0 = time.perf_counter()
                 cp = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
-            elif SURFACE == "stdin":
-                t0=time.perf_counter()
+
+            elif surface == "stdin":
+                t0 = time.perf_counter()
                 cp = subprocess.run([TARGET], input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
-            elif SURFACE == "env":
-                env = env.copy()
-                env["PAYLOAD"] = payload.decode("latin-1", errors="ignore")
-                t0=time.perf_counter()
-                cp = subprocess.run([TARGET], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
-            elif SURFACE == "file":
-                if FILE_ARG_INDEX is None:
-                    print("[repro] FILE_ARG_INDEX required for file"); sys.exit(2)
+
+            elif surface == "env":
+                env2 = env.copy()
+                env2["PAYLOAD"] = payload.decode("latin-1", errors="ignore")
+                t0 = time.perf_counter()
+                cp = subprocess.run([TARGET], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env2, timeout=TIMEOUT)
+
+            elif surface == "file":
+                idx = FILE_ARG_INDEX
+                if idx is None or idx < 1:
+                    print("[repro] FILE_ARG_INDEX (>=1) required for file"); sys.exit(2)
                 tmp_path = os.path.join(os.path.dirname(PAYLOAD_BIN), "input_{now_stamp()}.dat")
                 with open(tmp_path, "wb") as f:
                     f.write(payload)
-                max_idx = max(FILE_ARG_INDEX, 1)
-                argv = [TARGET] + ["DUMMY"] * max_idx
-                argv[FILE_ARG_INDEX] = tmp_path
-                t0=time.perf_counter()
+                argv = [TARGET] + ["DUMMY"] * idx
+                argv[idx] = tmp_path
+                t0 = time.perf_counter()
                 cp = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=TIMEOUT)
+
             else:
-                print("[repro] Unknown surface:", SURFACE); sys.exit(2)
+                print("[repro] Unknown surface:", surface); sys.exit(2)
 
             dt_ms = (time.perf_counter()-t0)*1000.0
+            print("[repro] target:", TARGET)
+            print("[repro] surface:", surface)
             print("[repro] returncode:", cp.returncode, "dt_ms=%.1f" % dt_ms)
             if cp.stdout:
                 print("[repro] --- stdout ---\\n" + cp.stdout.decode("utf-8", errors="replace"))
@@ -676,11 +756,15 @@ class ReproScriptBuilder:
             os.chmod(script_path, 0o755)
         except Exception:
             pass
+
         if run_after_write:
             try:
-                os.system(f"\"{sys.executable}\" \"{script_path}\"")
+                # Avoid cmd.exe quoting problems on Windows
+                import subprocess
+                subprocess.run([sys.executable, script_path], check=False)
             except Exception as e:
                 print(f"[repro] Error re-running: {e}")
+
         return {"payload_bin": bin_path, "payload_txt": txt_path, "reproducer_py": script_path}
 
 # ---------------- Core OOP inspector (IAT) ----------------
@@ -906,6 +990,8 @@ class FuzzSkeleton:
     - Deterministic, length-bounded mutator + length schedule
     - Simple runner for argv/stdin/env/file
     - Novelty-driven corpus, crash bucketing, minimizer, heuristics, WER watcher
+    - Upgrades: env-driven argv pre/post, stdin prefix, timeout-as-signal, deterministic token splice,
+                heuristic isolation during minimization, crash metadata sidecar, keep-running on finds
     """
     def __init__(self, *, target_path: str, surface: str,
                  timeout: float, arg_index: Optional[int],
@@ -936,7 +1022,24 @@ class FuzzSkeleton:
         self.tokens: List[bytes] = []
         self.wer = WerWatcher(os.environ.get("FUZZ_WER_DIR"))
 
-    # ---- deterministic mutator ----
+        # -------- Upgrades: env-driven argv layout & stdin prefix --------
+        def _env_list(name: str) -> List[str]:
+            val = os.environ.get(name, "")
+            if not val:
+                return []
+            try:
+                j = json.loads(val)
+                if isinstance(j, list):
+                    return [str(x) for x in j]
+            except Exception:
+                pass
+            return [p for p in val.split() if p]
+
+        self.pre_args = _env_list("FUZZ_ARGV_PRE")    # e.g. set FUZZ_ARGV_PRE=["--line"]
+        self.post_args = _env_list("FUZZ_ARGV_POST")  # e.g. set FUZZ_ARGV_POST=["--verbose"]
+        self.stdin_prefix = os.environ.get("FUZZ_STDIN_PREFIX", "").encode("latin-1", "ignore")
+
+    # ---- deterministic + smart CLI mutator (drop-in replacement) ----
     def _mutate(self, seed: bytes, iteration: int) -> bytes:
         def xorshift32(x: int) -> int:
             x ^= (x << 13) & 0xFFFFFFFF
@@ -949,7 +1052,7 @@ class FuzzSkeleton:
         def sanitize(buf: bytearray, avoid: set) -> bytearray:
             if not avoid: return buf
             st = 0xDEADBEEF
-            for i,b in enumerate(buf):
+            for i, b in enumerate(buf):
                 if b in avoid:
                     idx, st = rnd(st, 256)
                     rep = idx
@@ -958,23 +1061,35 @@ class FuzzSkeleton:
                     buf[i] = rep
             return buf
 
-        s = seed or b"A"
+        s  = seed or b"A"
         it = max(0, int(iteration))
+        # stable per (seed,len,it) hash
         seed_hash = ((len(s) & 0xFFFF) << 16) ^ (it & 0xFFFF) or 0xBEEFCAFE
-        strat = it % 7
 
+        # 1) SMART CLI STAGE (bias ~40% of iterations)
+        if _looks_like_cli(s) and (it % 10 in (0,2,5,8)):
+            base = _mk_cli_like_payload(seed_hash)
+            if self.tokens:
+                base = _splice_weighted(base, self.tokens, seed_hash)
+            # small random growth up to max_growth
+            grow = min(self.max_growth, (seed_hash & 0x3F))
+            out  = (base * ((len(base)+grow)//max(1,len(base))))[:len(base)+grow]
+            return out
+
+        # 2) YOUR ORIGINAL STRATEGIES (kept & refined)
+        strat = it % 8
         if strat == 0:
             out = bytes(sanitize(bytearray(s), self._avoid_set))
         elif strat == 1:
             buf = bytearray(s)
-            pos = (seed_hash % max(1,len(buf)))
+            pos = (seed_hash % max(1, len(buf)))
             bit = (seed_hash >> 5) & 7
             buf[pos] ^= (1 << bit)
             out = bytes(sanitize(buf, self._avoid_set))
         elif strat == 2:
             interesting = [0x00,0xFF,0x7F,0x80,0x20,0x0A,0x0D,0x09,0x41,0x61,0x2F,0x5C]
             buf = bytearray(s)
-            pos = seed_hash % max(1,len(buf))
+            pos = seed_hash % max(1, len(buf))
             buf[pos] = interesting[it % len(interesting)]
             out = bytes(sanitize(buf, self._avoid_set))
         elif strat == 3:
@@ -987,33 +1102,38 @@ class FuzzSkeleton:
                 buf[i] = (buf[i] + delta) & 0xFF
             out = bytes(sanitize(buf, self._avoid_set))
         elif strat == 4:
-            cap = min(len(s) + max(16, min(128, len(s) or 64)), len(s) + self.max_growth)
+            cap = min(len(s) + max(16, min(256, len(s) or 64)), len(s) + self.max_growth)
             base = s or b"A"
-            rep = (cap + len(base) - 1) // len(base)
-            buf = bytearray((base * rep)[:cap])
+            rep  = (cap + len(base) - 1) // len(base)
+            buf  = bytearray((base * rep)[:cap])
             if buf:
                 pos = seed_hash % len(buf)
                 buf[pos] = (buf[pos] ^ (it & 0x7F)) & 0xFF
             out = bytes(sanitize(buf, self._avoid_set))
         elif strat == 5 and self.tokens:
-            # splice-in token
-            tok = random.choice(self.tokens)
-            pos = seed_hash % (len(s)+1)
-            out = s[:pos] + tok + s[pos:]
+            out = _splice_weighted(s, self.tokens, seed_hash)
+        elif strat == 6:
+            # numeric edge-case replacement
+            m = re.search(rb"\d+", s)
+            if m:
+                start, end = m.span()
+                out = s[:start] + random.choice(_INT_EDGES) + s[end:]
+            else:
+                out = s + b"=" + random.choice(_INT_EDGES)
         else:
             mid = len(s) // 2
             out = (s[:mid] + s[:mid-1:-1]) if s else b"A"
 
-        # length schedule bias (prevents plateaus)
+        # 3) length schedule (smooth exploration)
         target_len = _length_schedule(it, len(s), self.max_growth)
         if len(out) < target_len:
-            out = (out + out[::-1] + b"A"*target_len)[:target_len]
+            out = (out + out[::-1] + b"A" * target_len)[:target_len]
         elif len(out) > target_len:
             head = target_len // 2
             tail = target_len - head
             out = out[:head] + out[-tail:]
 
-        return bytes(out)
+        return out
 
     def _choose_surface_for_payload(self, payload: bytes) -> Tuple[str, Optional[int], Optional[int]]:
         if self.surface != "auto":
@@ -1025,56 +1145,73 @@ class FuzzSkeleton:
         return "stdin", None, None
 
     # ---- runner for spawned process ----
-    def _execute(self, payload: bytes) -> Tuple[int, bytes, bytes, float]:
+    def _execute(self, payload: bytes) -> Tuple[Optional[int], bytes, bytes, float]:
         env = os.environ.copy()
         env.update(self.env_overrides or {})
 
         chosen_surface, arg_idx, file_idx = self._choose_surface_for_payload(payload)
+
         if chosen_surface == "argv":
             if arg_idx is None:
                 raise ValueError("argv surface requires --arg-index (auto)")
             max_idx = max(arg_idx, 1)
-            argv = [self.target_path] + ["DUMMY"] * max_idx
-            argv[arg_idx] = payload.decode("latin-1", errors="ignore")
+            argv = [self.target_path] + list(self.pre_args) + ["DUMMY"] * max_idx + list(self.post_args)
+            argv[len(self.pre_args) + arg_idx] = payload.decode("latin-1", errors="ignore")
             t0 = time.perf_counter()
-            cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env, timeout=self.timeout)
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            try:
+                cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                         env=env, timeout=self.timeout)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            except self.subprocess.TimeoutExpired:
+                dt_ms = self.timeout * 1000.0
+                return None, b"", b"[FuzzSkeleton] TimeoutExpired\n", dt_ms
 
         if chosen_surface == "stdin":
             t0 = time.perf_counter()
-            cp = self.subprocess.run([self.target_path], input=payload,
-                                     stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env, timeout=self.timeout)
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            try:
+                cp = self.subprocess.run([self.target_path],
+                                         input=self.stdin_prefix + payload,
+                                         stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                         env=env, timeout=self.timeout)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            except self.subprocess.TimeoutExpired:
+                dt_ms = self.timeout * 1000.0
+                return None, b"", b"[FuzzSkeleton] TimeoutExpired\n", dt_ms
 
         if chosen_surface == "env":
             env2 = env.copy()
             env2["PAYLOAD"] = payload.decode("latin-1", errors="ignore")
             t0 = time.perf_counter()
-            cp = self.subprocess.run([self.target_path], stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env2, timeout=self.timeout)
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            try:
+                cp = self.subprocess.run([self.target_path], stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                         env=env2, timeout=self.timeout)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            except self.subprocess.TimeoutExpired:
+                dt_ms = self.timeout * 1000.0
+                return None, b"", b"[FuzzSkeleton] TimeoutExpired\n", dt_ms
 
         if chosen_surface == "file":
             if file_idx is None:
                 raise ValueError("file surface requires --file-arg-index (auto)")
             tmp = os.path.join(self.out_dir, f"input_{now_stamp()}.dat")
-            # apply optional template
             to_write = with_file_template(payload, self.file_template)
             with open(tmp, "wb") as f:
                 f.write(to_write)
             max_idx = max(file_idx, 1)
-            argv = [self.target_path] + ["DUMMY"] * max_idx
-            argv[file_idx] = tmp
+            argv = [self.target_path] + list(self.pre_args) + ["DUMMY"] * max_idx + list(self.post_args)
+            argv[len(self.pre_args) + file_idx] = tmp
             t0 = time.perf_counter()
-            cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
-                                     env=env, timeout=self.timeout)
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            try:
+                cp = self.subprocess.run(argv, stdout=self.subprocess.PIPE, stderr=self.subprocess.PIPE,
+                                         env=env, timeout=self.timeout)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                return cp.returncode or 0, cp.stdout or b"", cp.stderr or b"", dt_ms
+            except self.subprocess.TimeoutExpired:
+                dt_ms = self.timeout * 1000.0
+                return None, b"", b"[FuzzSkeleton] TimeoutExpired\n", dt_ms
 
         raise ValueError(f"unknown surface: {chosen_surface}")
 
@@ -1155,7 +1292,12 @@ class FuzzSkeleton:
                         if ok2:
                             return True
                         if os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1":
-                            suspicious2, _r, _s = self.hsig.update_and_score(
+                            # isolate heuristics so we don't skew global baselines
+                            hs_tmp = HeuristicSignals()
+                            hs_tmp.lat_ms = list(self.hsig.lat_ms)
+                            hs_tmp.stderr_lens = list(self.hsig.stderr_lens)
+                            hs_tmp.rc_hist = dict(self.hsig.rc_hist)
+                            suspicious2, _r, _s = hs_tmp.update_and_score(
                                 dt_ms=_dt, stderr_len=len(se2 or b""), rc=rc2
                             )
                             return suspicious2
@@ -1169,6 +1311,24 @@ class FuzzSkeleton:
                 saved = self.corpus.save(payload, tag="crash")
                 if saved:
                     print(f"[crash] saved payload -> {saved}")
+                    # sidecar metadata for quick triage
+                    try:
+                        meta = {
+                            "target": self.target_path,
+                            "surface": self.surface,
+                            "rc": rc,
+                            "dt_ms": dt_ms,
+                            "indicators": indicators,
+                            "arg_index": self.arg_index,
+                            "file_arg_index": self.file_arg_index,
+                            "pre_args": self.pre_args,
+                            "post_args": self.post_args,
+                            "ts": now_stamp(),
+                        }
+                        with open(saved + ".json", "w", encoding="utf-8") as mf:
+                            json.dump(meta, mf, indent=2)
+                    except Exception:
+                        pass
 
                 print("\n=== PROBABLE VULN (spawned) ===")
                 print("Indicators:", ", ".join(indicators))
@@ -1183,8 +1343,7 @@ class FuzzSkeleton:
                     run_after_write=True
                 )
                 print("[fuzz] Repro bundle:", json.dumps(paths, indent=2))
-                print("[fuzz] Stopping after first positive (skeleton behavior).")
-                return
+                # keep going (do not return) to find more issues in the same run
 
         print("[fuzz] Completed without detecting probable buffer overflows.")
 
