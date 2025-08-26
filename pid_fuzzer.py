@@ -15,20 +15,7 @@ A unified asyncio-based toolkit that merges:
 Windows-only for IAT/Win32 parts. Python 3.9+.
 """
 
-import argparse
-import asyncio
-import base64
-import csv
-import datetime
-import hashlib
-import json
-import os
-import random
-import re
-import socket
-import sys
-import textwrap
-import time
+import argparse,asyncio,base64,csv,datetime,hashlib,json,os,random,re,socket,sys,textwrap,time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
