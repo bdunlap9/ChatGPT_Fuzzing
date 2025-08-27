@@ -3,23 +3,126 @@
 """
 Async Fuzz + IAT Inspector (Windows)
 ------------------------------------
-A unified asyncio-based toolkit that merges:
-  - IAT snapshotter (read-only)
-  - Strict overflow classifier (+ optional heuristic promotion)
-  - Reproducer bundle builder (payload + runnable script)
-  - Spawned-process fuzzing skeleton
-  - PID-attached fuzzing skeleton with transports (noop/file/tcp/pipe)
-  - WER CrashDump watcher, novelty map, crash bucketer, token harvesting,
-    seed loaders & auto-transport config, minimizer, and artifacts.
+Upgraded version with:
+  - Live config + hotkeys (pause/toggles/timeout)
+  - Target profile loader (URL or file)
+  - CLI help scraper (seeds flags/headers/env)
+  - Adaptive timeout (EWMA) + Windows argv length guard
+  - Stability re-check before calling "probable"
+  - Extra file templates (gif,jpeg,pdf,tar,7z)
+  - Optional concurrency for spawn fuzzing
+  - Extra PID transports (wmcopydata, file+notify)
 
 Windows-only for IAT/Win32 parts. Python 3.9+.
 """
 
-import argparse,asyncio,base64,csv,datetime,hashlib,json,os,random,re,socket,sys,textwrap,time
+import argparse,asyncio,base64,csv,datetime,hashlib,json,os,random,re,socket,sys,textwrap,time,threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Optional deps used in certain features
+try:
+    import requests  # for profile loader (URL)
+except Exception:
+    requests = None
+
+# -------------------- Live Config + Hotkeys --------------------
+
+class LiveConfig:
+    """
+    Simple polling config that hot-reloads from fuzz_config.json (or custom path).
+    Example fuzz_config.json:
+    {
+      "timeout": 2.0,
+      "require_stable": true,
+      "promote_heur": false,
+      "minimize": true
+    }
+    """
+    def __init__(self, path="fuzz_config.json"):
+        self.path = path
+        self._mtime = 0.0
+        self.data = {}
+        self._load()
+
+    def _load(self):
+        try:
+            st = os.stat(self.path)
+            if st.st_mtime <= self._mtime:
+                return
+            self._mtime = st.st_mtime
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.data = json.load(f)
+            print(f"[cfg] reloaded {self.path}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[cfg] load error: {e}")
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def poll(self):
+        self._load()
+
+
+def start_hotkeys_thread(live_cfg: LiveConfig):
+    """
+    Windows-only hotkey toggles:
+      P = pause/resume
+      H = toggle heuristic promotion
+      M = toggle minimizer
+      Up/Down arrows = +/- 0.5s base timeout
+    """
+    try:
+        import win32api
+    except Exception:
+        print("[hotkeys] win32api not available; hotkeys disabled")
+        return
+
+    def worker():
+        paused = False
+        while True:
+            # P toggle pause
+            if win32api.GetAsyncKeyState(ord('P')) & 0x8000:
+                paused = not paused
+                print(f"[hotkeys] paused={paused}")
+                os.environ["FUZZ_PAUSED"] = "1" if paused else "0"
+                time.sleep(0.2)
+
+            # H toggle heuristic promotion
+            if win32api.GetAsyncKeyState(ord('H')) & 0x8000:
+                v = os.environ.get("FUZZ_PROMOTE_HEUR", "0")
+                os.environ["FUZZ_PROMOTE_HEUR"] = "0" if v == "1" else "1"
+                print(f"[hotkeys] FUZZ_PROMOTE_HEUR={os.environ['FUZZ_PROMOTE_HEUR']}")
+                time.sleep(0.2)
+
+            # M toggle minimizer
+            if win32api.GetAsyncKeyState(ord('M')) & 0x8000:
+                v = os.environ.get("FUZZ_MINIMIZE", "1")
+                os.environ["FUZZ_MINIMIZE"] = "0" if v == "1" else "1"
+                print(f"[hotkeys] FUZZ_MINIMIZE={os.environ['FUZZ_MINIMIZE']}")
+                time.sleep(0.2)
+
+            # Up/Down adjust base timeout
+            if win32api.GetAsyncKeyState(0x26) & 0x8000:  # Up
+                t = float(os.environ.get("FUZZ_TIMEOUT_BASE", live_cfg.get("timeout", 2.0) or 2.0))
+                t = min(10.0, t + 0.5); os.environ["FUZZ_TIMEOUT_BASE"] = str(t)
+                print(f"[hotkeys] timeout={t:.1f}s"); time.sleep(0.15)
+            if win32api.GetAsyncKeyState(0x28) & 0x8000:  # Down
+                t = float(os.environ.get("FUZZ_TIMEOUT_BASE", live_cfg.get("timeout", 2.0) or 2.0))
+                t = max(0.2, t - 0.5); os.environ["FUZZ_TIMEOUT_BASE"] = str(t)
+                print(f"[hotkeys] timeout={t:.1f}s"); time.sleep(0.15)
+
+            live_cfg.poll()
+            time.sleep(0.05)
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+
 # -------------------- Constants / Dictionaries --------------------
+
 _URL_SCHEMES = [b"http", b"https", b"ftp", b"file"]
 _URL_HOSTS   = [b"localhost", b"127.0.0.1", b"[::1]"]
 _URL_PATHS   = [b"/", b"/%2e%2e/", b"/../../", b"/A"*64, b"/%00", b"/..%2f..%2f", b"/index.html"]
@@ -27,6 +130,7 @@ _METHODS     = [b"GET", b"POST", b"PUT", b"PATCH", b"DELETE", b"HEAD", b"OPTIONS
 _FLAGS_LIKE  = [b"-v", b"-i", b"-k", b"--tlsv1.0", b"--tls-max", b"--limit-rate", b"--proxy", b"--header", b"--data", b"--path-as-is", b"--output", b"-sS", b"--resolve", b"--url"]
 _INT_EDGES   = [b"0", b"1", b"2", b"7", b"8", b"9", b"10", b"15", b"16", b"31", b"32", b"63", b"64", b"127", b"128", b"255", b"256", b"1024", b"4095", b"4096", b"8191", b"8192"]
 _HDR_KEYS    = [b"Host", b"User-Agent", b"Accept", b"Cookie", b"Range", b"If-Modified-Since", b"Referer", b"Accept-Encoding"]
+
 
 def parse_env_kv(pairs: List[str]) -> Dict[str, str]:
     env: Dict[str, str] = {}
@@ -36,6 +140,55 @@ def parse_env_kv(pairs: List[str]) -> Dict[str, str]:
         k, v = p.split("=", 1)
         env[k] = v
     return env
+
+
+def load_target_profile(src: str) -> dict:
+    """
+    Load a target profile from URL or file. Example keys (all optional):
+      {
+        "ignore_rcs":[...],
+        "warn_rcs":[...],
+        "flags":["--foo","-X"],
+        "headers":["X-Thing"],
+        "env_keys":["FOO","BAR"],
+        "file_templates":["json","png"],
+        "default_surface":"stdin"
+      }
+    """
+    prof = {}
+    try:
+        if re.match(r'^https?://', src, re.I):
+            if not requests:
+                raise RuntimeError("requests not available for URL profiles")
+            r = requests.get(src, timeout=5)
+            r.raise_for_status()
+            prof = r.json()
+        else:
+            with open(src, "r", encoding="utf-8") as f:
+                prof = json.load(f)
+    except Exception as e:
+        print(f"[profile] failed to load {src}: {e}")
+        return {}
+    return prof
+
+
+def probe_cli_help(target_path: str) -> dict:
+    """
+    Scrape --help output to seed flags/headers/env tokens.
+    """
+    import subprocess
+    texts = []
+    for flag in ("--help","-h","/?"):
+        try:
+            cp = subprocess.run([target_path, flag], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0)
+            texts.append((cp.stdout or b"") + b"\n" + (cp.stderr or b""))
+        except Exception:
+            pass
+    blob = b"\n".join(texts).decode("utf-8", errors="ignore")
+    flags = sorted(set(re.findall(r"(?:--[A-Za-z0-9][\w\-]*|-{1}[A-Za-z])", blob)))
+    headers = sorted(set(re.findall(r"(?:Header|--header)\s+([A-Za-z][A-Za-z0-9\-]+):", blob, re.I)))
+    envs = sorted(set(re.findall(r"\b([A-Z][A-Z0-9_]{2,})=", blob)))
+    return {"flags": flags, "headers": headers, "envs": envs}
 
 
 # -------------------- Classifier (module scope) --------------------
@@ -59,65 +212,40 @@ class OverflowClassifier:
       FUZZ_STDERR_ADD_PAT        -> extra patterns, '|' separated (regex OR)
     """
 
-    # Strongly-fatal NTSTATUS codes that almost always indicate a real crash
     CRASH_STATUS_SET = {
-        0xC0000005,  # STATUS_ACCESS_VIOLATION
-        0xC0000409,  # STATUS_STACK_BUFFER_OVERRUN / FAST_FAIL
-        0xC0000374,  # STATUS_HEAP_CORRUPTION
-        0xC000001D,  # STATUS_ILLEGAL_INSTRUCTION
-        0xC00000FD,  # STATUS_STACK_OVERFLOW
-        0xC000008C,  # STATUS_ARRAY_BOUNDS_EXCEEDED
-        0xC0000094,  # STATUS_INTEGER_DIVIDE_BY_ZERO
-        0xC0000095,  # STATUS_INTEGER_OVERFLOW
-        0xC0000096,  # STATUS_PRIVILEGED_INSTRUCTION
-        0xC0000006,  # STATUS_IN_PAGE_ERROR (page-in AV)
-        0xC0000025,  # STATUS_NONCONTINUABLE_EXCEPTION
-        0xC0000028,  # STATUS_INVALID_DISPOSITION (bad SEH)
-        0xC000008E,  # STATUS_FLOAT_DIVIDE_BY_ZERO
-        0xC0000090,  # STATUS_FLOAT_INVALID_OPERATION
-        0xC0000091,  # STATUS_FLOAT_OVERFLOW
-        0xC0000092,  # STATUS_FLOAT_STACK_CHECK
-        0xC0000093,  # STATUS_FLOAT_UNDERFLOW
-        0xC00002B4,  # STATUS_FLOAT_MULTIPLE_FAULTS
-        0xC00002B5,  # STATUS_FLOAT_MULTIPLE_TRAPS
+        0xC0000005, 0xC0000409, 0xC0000374, 0xC000001D, 0xC00000FD,
+        0xC000008C, 0xC0000094, 0xC0000095, 0xC0000096, 0xC0000006,
+        0xC0000025, 0xC0000028, 0xC000008E, 0xC0000090, 0xC0000091,
+        0xC0000092, 0xC0000093, 0xC00002B4, 0xC00002B5,
     }
-
-    # Often-crashy but technically severity=warning (high bit 0x8000...). Treat as crash only if configured.
     WARN_STATUS_SET = {
-        0x80000001,  # STATUS_GUARD_PAGE_VIOLATION
-        0x80000002,  # STATUS_DATATYPE_MISALIGNMENT
-        0x80000003,  # STATUS_BREAKPOINT
-        0x80000004,  # STATUS_SINGLE_STEP
+        0x80000001, 0x80000002, 0x80000003, 0x80000004,
     }
-
-    # Things to ignore (common non-bugs)
     IGNORE_STATUS_SET = {
-        0xC000013A,  # STATUS_CONTROL_C_EXIT (Ctrl+C / external terminate)
+        0xC000013A,  # Ctrl+C
     }
 
-    # High-signal stderr patterns (Windows + sanitizers)
     OVERFLOW_STDERR_PATTERNS = [
         r"stack smashing detected",
         r"buffer overflow detected",
-        r"addresssanitizer|asan",              # ASan
-        r"ubsan|undefined behavior",           # UBSan
-        r"msan|tsan",                          # MSan/TSan
-        r"stack[- ]?buffer[- ]?overrun",       # MSVC wording
+        r"addresssanitizer|asan",
+        r"ubsan|undefined behavior",
+        r"msan|tsan",
+        r"stack[- ]?buffer[- ]?overrun",
         r"_security_check_cookie|stack cookie|__report_gsfailure|gsfailure",
         r"heap corruption|HEAP CORRUPTION DETECTED",
         r"RtlReportCriticalFailure",
-        r"invalid parameter",                  # UCRT invalid parameter handler
-        r"abort\(\)",                          # generic termination
+        r"invalid parameter",
+        r"abort\(\)",
         r"access violation|segmentation fault|segfault",
         r"Unhandled exception",
-        r"0xC0000[0-9A-Fa-f]{3}",              # explicit exception code mentions
+        r"0xC0000[0-9A-Fa-f]{3}",
         r"WER_CRASH_DUMP_DETECTED",
     ]
     _pat = re.compile("|".join(f"(?:{p})" for p in OVERFLOW_STDERR_PATTERNS), re.IGNORECASE)
 
     @staticmethod
     def _posix_signal(rc: Optional[int]) -> Optional[int]:
-        # rc < 0 often encodes a POSIX signal number (e.g. -11 => SIGSEGV)
         if rc is not None and rc < 0:
             return -rc
         return None
@@ -129,7 +257,6 @@ class OverflowClassifier:
         return rc & 0xFFFFFFFF
 
     def __init__(self):
-        # read env once
         self.any_c000_as_crash = os.environ.get("FUZZ_ANY_C000_AS_CRASH", "1") == "1"
         self.warn_as_crash     = os.environ.get("FUZZ_TREAT_WARN_AS_CRASH", "0") == "1"
         self.include_rc_hints  = os.environ.get("FUZZ_INCLUDE_RC_HINTS", "0") == "1"
@@ -139,13 +266,19 @@ class OverflowClassifier:
         if extra:
             self._pat = re.compile(self._pat.pattern + "|" + extra, re.IGNORECASE)
 
-        # light caches
         self._crash_set  = OverflowClassifier.CRASH_STATUS_SET
         self._warn_set   = OverflowClassifier.WARN_STATUS_SET
         self._ignore_set = OverflowClassifier.IGNORE_STATUS_SET
 
-        # POSIX crashy signals (if rc is -signal)
-        self._posix_severe = {11, 6, 4, 8, 5, 7}  # SEGV, ABRT, ILL, FPE, TRAP, BUS
+        self._posix_severe = {11, 6, 4, 8, 5, 7}
+
+        # Per-target overrides (plain rc, not NTSTATUS)
+        self._ignore_plain_rcs: set[int] = set()
+        self._warn_plain_rcs: set[int]   = set()
+
+    def set_target_overrides(self, ignore_rcs: Optional[set] = None, warn_rcs: Optional[set] = None):
+        self._ignore_plain_rcs = set(ignore_rcs or [])
+        self._warn_plain_rcs   = set(warn_rcs or [])
 
     def classify(self, rc: Optional[int], stderr: bytes) -> Tuple[bool, List[str]]:
         inds: List[str] = []
@@ -177,28 +310,50 @@ class OverflowClassifier:
             strong = True
 
         if win is not None:
-            # Ignore clean external kill / Ctrl+C
             if win in self._ignore_set:
                 inds.append(f"win:ignored:0x{win:08X}")
             else:
-                # Treat known fatal statuses as strong
                 if win in self._crash_set:
                     inds.append(f"win:0x{win:08X}")
                     strong = True
-                # Optionally treat any 0xC000**** as strong (except ignored)
                 elif self.any_c000_as_crash and (win & 0xC0000000) == 0xC0000000:
                     inds.append(f"win:c000+:{win:08X}")
                     strong = True
-                # Optionally treat 0x8000**** as crash (guard page, misalignment, etc.)
                 elif self.warn_as_crash and (win & 0x80000000) == 0x80000000:
                     inds.append(f"win:warn:0x{win:08X}")
                     strong = True
-                else:
-                    # Keep as hint only (don’t flip to crash)
-                    if self.include_rc_hints:
-                        inds.append(f"rc:{rc}")
+
+        # Plain rc overrides (from target profile or config)
+        if rc is not None:
+            if rc in self._ignore_plain_rcs:
+                inds.append(f"rc:ignored:{rc}")
+                return False, inds
+            if rc in self._warn_plain_rcs:
+                inds.append(f"rc:warn:{rc}")
+
+            if not strong and self.include_rc_hints:
+                inds.append(f"rc:{rc}")
 
         return strong, inds
+
+
+# -------------------- Adaptive Timeout --------------------
+
+class AdaptiveTimeout:
+    """
+    Lightweight EWMA adaptive timeout: next_timeout ~= clamp(0.2 .. 10.0, 3x mean latency)
+    """
+    def __init__(self, base=2.0):
+        self.base = float(base)
+        self.mean = self.base * 1000.0
+        self.alpha = 0.2
+
+    def observe(self, dt_ms: float):
+        self.mean = (1-self.alpha)*self.mean + self.alpha*dt_ms
+
+    def next_timeout(self) -> float:
+        t = max(0.2, min(10.0, (self.mean * 0.003)))  # 3x mean (ms to s)
+        return t
 
 
 # -------------------- Unified Async Class --------------------
@@ -430,6 +585,16 @@ class AsyncFuzzInspector:
         if k == "wav":
             body = payload[:4096]
             return b"RIFF" + (36+len(body)).to_bytes(4,"little") + b"WAVEfmt " + (16).to_bytes(4,"little") + (1).to_bytes(2,"little")+ (1).to_bytes(2,"little") + (8000).to_bytes(4,"little")+ (8000).to_bytes(4,"little")+ (1).to_bytes(2,"little")+ (8).to_bytes(2,"little")+ b"data" + len(body).to_bytes(4,"little") + body
+        if k == "gif":
+            return b"GIF89a" + payload[:4096]
+        if k in ("jpg","jpeg"):
+            return b"\xFF\xD8\xFF" + payload[:4096] + b"\xFF\xD9"
+        if k == "pdf":
+            return b"%PDF-1.4\n" + payload[:8000] + b"\n%%EOF\n"
+        if k == "tar":
+            return b"\x00" * 512 + payload[:16384]
+        if k == "7z":
+            return b"7z\xBC\xAF\x27\x1C" + payload[:8192]
         return payload
 
     # ---------------- Token Harvest ----------------
@@ -1190,6 +1355,11 @@ class AsyncFuzzInspector:
     async def _execute_spawn(self, *, target_path: str, payload: bytes, surface: str, timeout: float, arg_index: Optional[int], file_arg_index: Optional[int], env_overrides: Dict[str, str]) -> Tuple[Optional[int], bytes, bytes, float]:
         env = os.environ.copy(); env.update(env_overrides or {})
         t0 = time.perf_counter()
+
+        def _would_exceed_windows_cmdline(argv_list: List[str]) -> bool:
+            joined = " ".join(argv_list)
+            return len(joined) > 32000  # conservative guard
+
         try:
             if surface == "argv":
                 if arg_index is None:
@@ -1197,6 +1367,13 @@ class AsyncFuzzInspector:
                 max_idx = max(arg_index, 1)
                 argv = [target_path] + list(self.pre_args) + ["DUMMY"] * max_idx + list(self.post_args)
                 argv[len(self.pre_args) + arg_index] = payload.decode("latin-1", errors="ignore")
+                if os.name == "nt" and _would_exceed_windows_cmdline(argv):
+                    # Auto-fallback if command line too long
+                    fb_surface = "file" if file_arg_index is not None else "stdin"
+                    return await self._execute_spawn(
+                        target_path=target_path, payload=payload, surface=fb_surface, timeout=timeout,
+                        arg_index=arg_index, file_arg_index=file_arg_index, env_overrides=env_overrides
+                    )
                 proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
                 try:
                     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -1283,105 +1460,136 @@ class AsyncFuzzInspector:
         return "stdin", None, None
 
     # ---------------- Spawned-process Fuzzer ----------------
-    async def fuzz_spawn(self, *, target_path: str, surface: str, timeout: float, arg_index: Optional[int], file_arg_index: Optional[int], env_overrides: Dict[str, str], seeds: List[bytes], max_iters: int) -> None:
+    async def fuzz_spawn(self, *, target_path: str, surface: str, base_timeout: float, arg_index: Optional[int], file_arg_index: Optional[int], env_overrides: Dict[str, str], seeds: List[bytes], max_iters: int, max_concurrency: int, require_stable: bool) -> None:
         if not seeds:
             print("[fuzz] No seeds provided; nothing to do.")
             return
         print(f"[fuzz] Skeleton started | target={target_path} | surface={surface} | iters={max_iters} | seeds={len(seeds)}")
         corpus = self.CorpusManager()
         repro  = self.ReproScriptBuilder(out_dir="crashes")
+        adaptive = AdaptiveTimeout(base=base_timeout)
+
+        async def do_iteration(seed: bytes, it: int):
+            payload = self._mutate_spawn(seed, it)
+            chosen_surface, arg_idx, file_idx = self._choose_surface_for_payload(surface, payload, arg_index, file_arg_index)
+            to = adaptive.next_timeout()
+            rc, stdout, stderr, dt_ms = await self._execute_spawn(
+                target_path=target_path, payload=payload, surface=chosen_surface, timeout=to,
+                arg_index=arg_idx, file_arg_index=file_idx, env_overrides=env_overrides
+            )
+            adaptive.observe(dt_ms)
+            return payload, chosen_surface, arg_idx, file_idx, rc, stdout, stderr, dt_ms
 
         for si, seed in enumerate(seeds):
             print(f"[fuzz] seed {si+1}/{len(seeds)} (len={len(seed)})")
-            for it in range(max(1, max_iters)):
-                try:
-                    payload = self._mutate_spawn(seed, it)
-                except Exception as e:
-                    print(f"[fuzz] mutation error at iter {it}: {e}")
-                    continue
+            it = 0
+            while it < max_iters:
+                # pause support
+                while os.environ.get("FUZZ_PAUSED", "0") == "1":
+                    await asyncio.sleep(0.1)
 
-                chosen_surface, arg_idx, file_idx = self._choose_surface_for_payload(surface, payload, arg_index, file_arg_index)
-                rc, stdout, stderr, dt_ms = await self._execute_spawn(
-                    target_path=target_path, payload=payload, surface=chosen_surface, timeout=timeout,
-                    arg_index=arg_idx, file_arg_index=file_idx, env_overrides=env_overrides
-                )
+                # batch size for concurrency
+                batch = min(max_concurrency, max_iters - it)
+                tasks = [asyncio.create_task(do_iteration(seed, it + j)) for j in range(batch)]
+                results = await asyncio.gather(*tasks, return_exceptions=False)
 
-                wer_new = self.wer.poll_new()
-                if wer_new:
-                    print(f"[wer] new crash dumps detected: {len(wer_new)}")
-                    stderr = (stderr or b"") + b"\nWER_CRASH_DUMP_DETECTED\n"
+                for payload, chosen_surface, arg_idx, file_idx, rc, stdout, stderr, dt_ms in results:
+                    # WER marker
+                    wer_new = self.wer.poll_new()
+                    if wer_new:
+                        print(f"[wer] new crash dumps detected: {len(wer_new)}")
+                        stderr = (stderr or b"") + b"\nWER_CRASH_DUMP_DETECTED\n"
 
-                new_toks = self.harvest_tokens_from_stderr(stderr)
-                for t in new_toks:
-                    if t not in self.tokens:
-                        self.tokens.append(t)
-                if new_toks:
-                    print(f"[dict] harvested {len(new_toks)} tokens from stderr (total {len(self.tokens)})")
+                    # tokens from stderr
+                    new_toks = self.harvest_tokens_from_stderr(stderr)
+                    for t in new_toks:
+                        if t not in self.tokens:
+                            self.tokens.append(t)
+                    if new_toks:
+                        print(f"[dict] harvested {len(new_toks)} tokens from stderr (total {len(self.tokens)})")
 
-                if self.novelty.accept(rc=rc, dt_ms=dt_ms, stdout=stdout, stderr=stderr):
-                    saved = corpus.save(payload, tag="novel")
-                    if saved:
-                        print(f"[corpus] novel behavior -> saved {saved}")
+                    # novelty -> corpus
+                    if self.novelty.accept(rc=rc, dt_ms=dt_ms, stdout=stdout, stderr=stderr):
+                        saved = corpus.save(payload, tag="novel")
+                        if saved:
+                            print(f"[corpus] novel behavior -> saved {saved}")
 
-                suspicious, h_reasons, _h_score = self.hsig.update_and_score(dt_ms=dt_ms, stderr_len=len(stderr or b""), rc=rc)
+                    suspicious, h_reasons, _h_score = self.hsig.update_and_score(dt_ms=dt_ms, stderr_len=len(stderr or b""), rc=rc)
+                    is_overflow, indicators = self.classifier.classify(rc, stderr)
+                    crashed = is_overflow
+                    if not crashed and os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1" and suspicious:
+                        crashed = True
+                        indicators = (indicators or []) + [f"heur:{'+'.join(h_reasons)}"]
 
-                is_overflow, indicators = self.classifier.classify(rc, stderr)
-                crashed = is_overflow
-                if not crashed and os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1" and suspicious:
-                    crashed = True
-                    indicators = (indicators or []) + [f"heur:{'+'.join(h_reasons)}"]
+                    if not crashed:
+                        continue
 
-                if not crashed:
-                    continue
-
-                if self.crash_buckets.seen_before(rc, stderr):
-                    print("[crash] duplicate bucket; skipping repro bundle")
-                    continue
-
-                do_min = os.environ.get("FUZZ_MINIMIZE", "1") == "1"
-                min_ms = int(os.environ.get("FUZZ_MINIMIZE_BUDGET_MS", "1200"))
-                if do_min:
-                    async def pred(b: bytes) -> bool:
-                        rc2, _so2, se2, _dt = await self._execute_spawn(
-                            target_path=target_path, payload=b, surface=chosen_surface, timeout=timeout,
+                    # Stability re-check (same payload, once more)
+                    if require_stable:
+                        to2 = adaptive.next_timeout()
+                        rc2, _so2, se2, _dt2 = await self._execute_spawn(
+                            target_path=target_path, payload=payload, surface=chosen_surface, timeout=to2,
                             arg_index=arg_idx, file_arg_index=file_idx, env_overrides=env_overrides
                         )
                         ok2, _ = self.classifier.classify(rc2, se2)
-                        if ok2: return True
-                        if os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1":
-                            hs_tmp = self.HeuristicSignals()
-                            hs_tmp.lat_ms = list(self.hsig.lat_ms)
-                            hs_tmp.stderr_lens = list(self.hsig.stderr_lens)
-                            hs_tmp.rc_hist = dict(self.hsig.rc_hist)
-                            suspicious2, _r, _s = hs_tmp.update_and_score(dt_ms=_dt, stderr_len=len(se2 or b""), rc=rc2)
-                            return suspicious2
-                        return False
-                    payload_min = await self.minimize_payload_async(payload, pred, time_budget_ms=min_ms)
-                    if len(payload_min) < len(payload):
-                        print(f"[min] shrank payload {len(payload)} -> {len(payload_min)} bytes")
-                        payload = payload_min
+                        if not ok2:
+                            print("[crash] unstable (second run did not reproduce); skipping")
+                            continue
 
-                saved = corpus.save(payload, tag="crash")
-                if saved:
-                    print(f"[crash] saved payload -> {saved}")
-                    try:
-                        meta = {
-                            "target": target_path, "surface": chosen_surface, "rc": rc, "dt_ms": dt_ms,
-                            "indicators": indicators, "arg_index": arg_idx, "file_arg_index": file_idx,
-                            "pre_args": self.pre_args, "post_args": self.post_args, "ts": self.now_stamp(),
-                        }
-                        with open(saved + ".json", "w", encoding="utf-8") as mf:
-                            json.dump(meta, mf, indent=2)
-                    except Exception:
-                        pass
+                    if self.crash_buckets.seen_before(rc, stderr):
+                        print("[crash] duplicate bucket; skipping repro bundle")
+                        continue
 
-                print("\n=== PROBABLE VULN (spawned) ===")
-                print("Indicators:", ", ".join(indicators))
-                paths = repro.build_and_optionally_run(
-                    target_path=target_path, surface=chosen_surface, payload=payload, timeout=timeout,
-                    arg_index=arg_idx, env_overrides=env_overrides, file_arg_index=file_idx, run_after_write=True
-                )
-                print("[fuzz] Repro bundle:", json.dumps(paths, indent=2))
+                    # Minimization (optional)
+                    do_min = os.environ.get("FUZZ_MINIMIZE", "1") == "1"
+                    min_ms = int(os.environ.get("FUZZ_MINIMIZE_BUDGET_MS", "1200"))
+                    if do_min:
+                        async def pred(b: bytes) -> bool:
+                            to3 = adaptive.next_timeout()
+                            rc3, _so3, se3, _dt3 = await self._execute_spawn(
+                                target_path=target_path, payload=b, surface=chosen_surface, timeout=to3,
+                                arg_index=arg_idx, file_arg_index=file_idx, env_overrides=env_overrides
+                            )
+                            ok3, _ = self.classifier.classify(rc3, se3)
+                            if ok3: return True
+                            if os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1":
+                                hs_tmp = self.HeuristicSignals()
+                                hs_tmp.lat_ms = list(self.hsig.lat_ms)
+                                hs_tmp.stderr_lens = list(self.hsig.stderr_lens)
+                                hs_tmp.rc_hist = dict(self.hsig.rc_hist)
+                                suspicious3, _r, _s = hs_tmp.update_and_score(dt_ms=_dt3, stderr_len=len(se3 or b""), rc=rc3)
+                                return suspicious3
+                            return False
+                        payload_min = await self.minimize_payload_async(payload, pred, time_budget_ms=min_ms)
+                        if len(payload_min) < len(payload):
+                            print(f"[min] shrank payload {len(payload)} -> {len(payload_min)} bytes")
+                            payload = payload_min
+
+                    # Save crash + meta
+                    saved = corpus.save(payload, tag="crash")
+                    if saved:
+                        print(f"[crash] saved payload -> {saved}")
+                        try:
+                            meta = {
+                                "target": target_path, "surface": chosen_surface, "rc": rc, "dt_ms": dt_ms,
+                                "indicators": indicators, "arg_index": arg_idx, "file_arg_index": file_idx,
+                                "pre_args": self.pre_args, "post_args": self.post_args, "ts": self.now_stamp(),
+                            }
+                            with open(saved + ".json", "w", encoding="utf-8") as mf:
+                                json.dump(meta, mf, indent=2)
+                        except Exception:
+                            pass
+
+                    print("\n=== PROBABLE VULN (spawned) ===")
+                    print("Indicators:", ", ".join(indicators))
+                    paths = repro.build_and_optionally_run(
+                        target_path=target_path, surface=chosen_surface, payload=payload, timeout=adaptive.next_timeout(),
+                        arg_index=arg_idx, env_overrides=env_overrides, file_arg_index=file_idx, run_after_write=True
+                    )
+                    print("[fuzz] Repro bundle:", json.dumps(paths, indent=2))
+
+                it += batch
+
         print("[fuzz] Completed.")
 
     # ---------------- PID Delivery ----------------
@@ -1409,6 +1617,17 @@ class AsyncFuzzInspector:
                     json.dump({"bytes": len(to_write), "timestamp": stamp}, mf, indent=2)
             await asyncio.to_thread(_write)
             print(f"[fuzz-pid] (file) wrote payload -> {out_path}")
+            return
+
+        if mode == "file+notify":
+            stamp = self.now_stamp()
+            out_path = os.path.join(drop_dir, f"payload_{stamp}.bin")
+            def _write2():
+                with open(out_path, "wb") as w:
+                    w.write(payload)
+                open(out_path + ".trig","wb").close()
+            await asyncio.to_thread(_write2)
+            print(f"[fuzz-pid] (file+notify) wrote {out_path} and trigger file")
             return
 
         if mode == "tcp":
@@ -1469,7 +1688,30 @@ class AsyncFuzzInspector:
             print(f"[fuzz-pid] (pipe) wrote {len(payload)} bytes to {pipe_name}")
             return
 
-        raise ValueError(f"Unknown FUZZ_PID_MODE='{mode}' (expected noop|file|tcp|pipe)")
+        if mode == "wmcopydata":
+            import ctypes as C, ctypes.wintypes as W
+            user32 = C.WinDLL("user32", use_last_error=True)
+            FindWindowW = user32.FindWindowW
+            FindWindowW.argtypes = [W.LPCWSTR, W.LPCWSTR]
+            FindWindowW.restype = W.HWND
+            SendMessageW = user32.SendMessageW
+            SendMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
+            SendMessageW.restype = W.LRESULT
+            class COPYDATASTRUCT(C.Structure):
+                _fields_=[("dwData", W.ULONG_PTR), ("cbData", W.DWORD), ("lpData", W.LPVOID)]
+            target_class = os.environ.get("FUZZ_PID_WNDCLASS","")
+            target_caption = os.environ.get("FUZZ_PID_WNDCAPTION","")
+            hwnd = FindWindowW(target_class or None, target_caption or None)
+            if not hwnd:
+                raise OSError("target window not found (set FUZZ_PID_WNDCLASS / FUZZ_PID_WNDCAPTION)")
+            buf = C.create_string_buffer(payload)
+            cds = COPYDATASTRUCT(0, len(payload), C.cast(buf, W.LPVOID))
+            WM_COPYDATA = 0x004A
+            SendMessageW(hwnd, WM_COPYDATA, 0, C.byref(cds))
+            print(f"[fuzz-pid] (wmcopydata) sent {len(payload)} bytes")
+            return
+
+        raise ValueError(f"Unknown FUZZ_PID_MODE='{mode}' (expected noop|file|file+notify|tcp|pipe|wmcopydata)")
 
     async def _collect_signals(self, *, timeout: float) -> Tuple[Optional[int], bytes]:
         rc: Optional[int] = None
@@ -1486,7 +1728,7 @@ class AsyncFuzzInspector:
         return rc, data
 
     # ---------------- PID Fuzzer ----------------
-    async def fuzz_pid(self, *, pid: int, target_path_for_repro: str, surface: str, timeout: float, arg_index: Optional[int], file_arg_index: Optional[int], env_overrides: Dict[str, str], seeds: List[bytes], labels: List[str], max_iters: int) -> None:
+    async def fuzz_pid(self, *, pid: int, target_path_for_repro: str, surface: str, base_timeout: float, arg_index: Optional[int], file_arg_index: Optional[int], env_overrides: Dict[str, str], seeds: List[bytes], labels: List[str], max_iters: int, require_stable: bool) -> None:
         avoid_hex  = os.environ.get("FUZZ_PID_AVOID_HEX", "")
         avoid_set = {int(t, 16) & 0xFF for t in re.split(r"[,\s]+", avoid_hex) if t} if avoid_hex else set()
 
@@ -1503,10 +1745,14 @@ class AsyncFuzzInspector:
 
         corpus = self.CorpusManager()
         repro  = self.ReproScriptBuilder(out_dir="crashes")
+        adaptive = AdaptiveTimeout(base=base_timeout)
 
         for si, seed in enumerate(seeds or [b"A"]):
             print(f"[fuzz-pid] seed {si+1}/{max(1,len(seeds))} (len={len(seed)})")
             for it in range(max(1, max_iters)):
+                while os.environ.get("FUZZ_PAUSED", "0") == "1":
+                    await asyncio.sleep(0.1)
+
                 try:
                     payload = self._mutate_pid(seed, it, avoid_set)
                 except Exception as e:
@@ -1515,10 +1761,11 @@ class AsyncFuzzInspector:
 
                 try:
                     t0 = time.perf_counter()
-                    await self._deliver_to_pid(payload=payload, timeout=timeout)
-                    rc, stderr = await self._collect_signals(timeout=timeout)
+                    await self._deliver_to_pid(payload=payload, timeout=adaptive.next_timeout())
+                    rc, stderr = await self._collect_signals(timeout=adaptive.next_timeout())
                     dt_ms = (time.perf_counter() - t0) * 1000.0
                     stdout = b""
+                    adaptive.observe(dt_ms)
                 except Exception as e:
                     print(f"[fuzz-pid] delivery error at iter {it}: {e}")
                     continue
@@ -1551,24 +1798,33 @@ class AsyncFuzzInspector:
                 if not crashed:
                     continue
 
+                # Stability re-check
+                if require_stable:
+                    t1 = time.perf_counter()
+                    await self._deliver_to_pid(payload=payload, timeout=adaptive.next_timeout())
+                    rc2, se2 = await self._collect_signals(timeout=adaptive.next_timeout())
+                    _dt2 = (time.perf_counter() - t1) * 1000.0
+                    ok2, _ = self.classifier.classify(rc2, se2)
+                    if not ok2:
+                        print("[crash] unstable (second run did not reproduce); skipping")
+                        continue
+
                 if self.crash_buckets.seen_before(rc, stderr):
                     print("[crash] duplicate bucket; skipping repro bundle")
                     continue
 
-                # ----- Minimization (optional) -----
+                # Minimization (optional)
                 do_min = os.environ.get("FUZZ_MINIMIZE", "1") == "1"
                 min_ms = int(os.environ.get("FUZZ_MINIMIZE_BUDGET_MS", "1200"))
                 if do_min:
                     async def pred(b: bytes) -> bool:
                         t0 = time.perf_counter()
-                        await self._deliver_to_pid(payload=b, timeout=timeout)
-                        rc2, se2 = await self._collect_signals(timeout=timeout)
+                        await self._deliver_to_pid(payload=b, timeout=adaptive.next_timeout())
+                        rc2, se2 = await self._collect_signals(timeout=adaptive.next_timeout())
                         dt2 = (time.perf_counter() - t0) * 1000.0
-                        # Strong signals win
                         ok2, _ = self.classifier.classify(rc2, se2)
                         if ok2:
                             return True
-                        # Optional heuristic promotion
                         if os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1":
                             hs_tmp = self.HeuristicSignals()
                             hs_tmp.lat_ms = list(self.hsig.lat_ms)
@@ -1585,7 +1841,7 @@ class AsyncFuzzInspector:
                         print(f"[min] shrank payload {len(payload)} -> {len(payload_min)} bytes")
                         payload = payload_min
 
-                # ----- Save artifacts & meta -----
+                # Save artifacts & meta
                 saved = corpus.save(payload, tag="crash")
                 if saved:
                     print(f"[crash] saved payload -> {saved}")
@@ -1608,7 +1864,7 @@ class AsyncFuzzInspector:
                     except Exception:
                         pass
 
-                    # ----- Build a runnable "deliver" script that replays the same PID transport -----
+                    # Build a runnable "deliver" script to replay the same PID transport
                     def _build_pid_repro(payload_path: str) -> str:
                         mode = (os.environ.get("FUZZ_PID_MODE", "noop") or "noop").strip().lower()
                         drop_dir = (os.environ.get("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries")) or "").strip()
@@ -1640,6 +1896,16 @@ def main():
         with open(out_path + ".meta.json", "w", encoding="utf-8") as mf:
             mf.write('{{"bytes":%d,"timestamp":"%s"}}' % (len(data), stamp))
         print("[repro-pid] wrote", out_path)
+        return
+
+    if mode == "file+notify":
+        os.makedirs(drop_dir, exist_ok=True)
+        stamp = str(int(time.time()*1e6))
+        out_path = os.path.join(drop_dir, "payload_" + stamp + ".bin")
+        with open(out_path, "wb") as w:
+            w.write(data)
+        open(out_path + ".trig","wb").close()
+        print("[repro-pid] wrote", out_path, "and trigger file")
         return
 
     if mode == "tcp":
@@ -1720,13 +1986,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sp.add_argument("--env", action="append", default=[], help="KEY=VALUE (repeatable)")
     sp.add_argument("--iters", type=int, default=64)
     sp.add_argument("--seeds", help="Path to directory (.bin files) or JSON/JSONL with data_b64")
-    sp.add_argument("--file-template", choices=["png","zip","json","xml","bmp","wav"])
+    sp.add_argument("--file-template", choices=["png","zip","json","xml","bmp","wav","gif","jpg","jpeg","pdf","tar","7z"])
     sp.add_argument("--argv-pre", action="append", default=[], help="Prepend fixed argv before payload (repeatable)")
     sp.add_argument("--argv-post", action="append", default=[], help="Append fixed argv after payload (repeatable)")
     sp.add_argument("--promote-heur", action="store_true", help="Promote heuristic spikes to 'probable' crashes")
     sp.add_argument("--no-minimize", action="store_true", help="Disable on-crash minimization")
+    sp.add_argument("--profile", help="Target profile JSON (path or URL)")
+    sp.add_argument("--max-concurrency", type=int, default=1, help="Concurrent iterations per seed (spawn mode)")
 
-    pp = sub.add_parser("fuzz-pid", help="Fuzz an already-running PID via transports (noop/file/tcp/pipe)")
+    pp = sub.add_parser("fuzz-pid", help="Fuzz an already-running PID via transports (noop/file/file+notify/tcp/pipe/wmcopydata)")
     pp.add_argument("--pid", type=int, required=True)
     pp.add_argument("--target-for-repro", required=True, help="Local executable to run in generated repro script")
     pp.add_argument("--surface", default="auto", choices=["auto","argv","stdin","env","file"], help="Surface for repro runs")
@@ -1736,9 +2004,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pp.add_argument("--env", action="append", default=[], help="KEY=VALUE (repeatable) passed to repro")
     pp.add_argument("--iters", type=int, default=64)
     pp.add_argument("--seeds", help="Path to directory (.bin files) or JSON/JSONL with data_b64")
-    pp.add_argument("--file-template", choices=["png","zip","json","xml","bmp","wav"])
+    pp.add_argument("--file-template", choices=["png","zip","json","xml","bmp","wav","gif","jpg","jpeg","pdf","tar","7z"])
     pp.add_argument("--autoconfig", action="store_true", help="Infer FUZZ_PID_MODE (tcp/pipe/file) from seed labels")
     pp.add_argument("--avoid-hex", default="", help="Comma/space separated hex bytes to avoid (e.g. '00,0a,0d')")
+    pp.add_argument("--profile", help="Target profile JSON (path or URL) for repro hints")
 
     iat = sub.add_parser("iat", help="List IAT entries for a PID and write artifacts")
     iat.add_argument("--pid", type=int, required=True)
@@ -1753,8 +2022,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     return p
 
+
 async def main_async(argv: List[str]) -> None:
     args = build_arg_parser().parse_args(argv)
+
+    # Live config + hotkeys
+    live_cfg = LiveConfig("fuzz_config.json")
+    start_hotkeys_thread(live_cfg)
+
     af = AsyncFuzzInspector()
 
     # Common env toggles
@@ -1773,59 +2048,166 @@ async def main_async(argv: List[str]) -> None:
         os.environ["FUZZ_ARGV_POST"] = json.dumps(args.argv_post or [])
         af.post_args = args.argv_post or []
 
-    if args.cmd == "fuzz-spawn":
-        env_overrides = parse_env_kv(args.env)
-        seeds: List[bytes] = [b"A"]; labels: List[str] = ["generic"]
-        if args.seeds:
+    # Profiles (target-aware flags/headers/env/RCs/defaults)
+    prof = {}
+    prof_src = getattr(args, "profile", None)
+    if prof_src:
+        prof = load_target_profile(prof_src)
+        if prof.get("ignore_rcs") or prof.get("warn_rcs"):
+            af.classifier.set_target_overrides(ignore_rcs=set(prof.get("ignore_rcs", [])), warn_rcs=set(prof.get("warn_rcs", [])))
+        for fl in prof.get("flags", []) or []:
+            b = fl.encode() if isinstance(fl, str) else fl
+            if b not in _FLAGS_LIKE: _FLAGS_LIKE.append(b)
+        for hk in prof.get("headers", []) or []:
+            b = hk.encode() if isinstance(hk, str) else hk
+            if b not in _HDR_KEYS: _HDR_KEYS.append(b)
+        for ek in prof.get("env_keys", []) or []:
+            tok = f"{ek}=".encode()
+            if tok not in af.tokens: af.tokens.append(tok)
+        if not getattr(args, "file_template", None) and prof.get("file_templates"):
+            os.environ["FUZZ_FILE_TEMPLATE"] = prof["file_templates"][0]; af.file_template = prof["file_templates"][0]
+        if getattr(args, "surface", "auto") == "auto" and prof.get("default_surface"):
+            args.surface = prof["default_surface"]
+
+    # Adaptive timeout base (live-configurable)
+    base_timeout = float(os.environ.get("FUZZ_TIMEOUT_BASE", live_cfg.get("timeout", getattr(args, "timeout", 2.0))))
+
+    # Probe help (spawn target or repro target) to harvest flags/headers/env keys
+    try:
+        if args.cmd == "fuzz-spawn":
+            h = probe_cli_help(args.target)
+        elif args.cmd == "fuzz-pid":
+            h = probe_cli_help(args.target_for_repro)
+        else:
+            h = {"flags": [], "headers": [], "envs": []}
+        for fl in h["flags"]:
+            b = fl.encode()
+            if b not in _FLAGS_LIKE: _FLAGS_LIKE.append(b)
+        for hk in h["headers"]:
+            b = hk.encode()
+            if b not in _HDR_KEYS: _HDR_KEYS.append(b)
+        for hk in h["headers"]:
+            b = hk.encode()
+            if b not in _HDR_KEYS:
+                _HDR_KEYS.append(b)
+        for ev in h["envs"]:
+            tok = f"{ev}=".encode()
+            if tok not in af.tokens:
+                af.tokens.append(tok)
+    except Exception as e:
+        print(f"[help-scrape] skipped: {e}")
+
+    # Load and dedupe seeds
+    seeds: List[bytes] = []
+    labels: List[str] = []
+    if getattr(args, "seeds", None):
+        try:
             seeds, labels = AsyncFuzzInspector.load_seeds_any(args.seeds)
-            seeds, labels = AsyncFuzzInspector.dedupe_bytes_with_labels(seeds, labels)
+        except Exception as e:
+            print(f"[seeds] failed to load {args.seeds}: {e}")
+    if not seeds:
+        # Reasonable defaults if no seeds provided
+        seeds = [
+            b"A" * 64,
+            b"--help",
+            b"-v",
+            b"GET http://localhost/ HTTP/1.1",
+            b"Host: localhost",
+            b"http://127.0.0.1/?q=AAAA",
+        ]
+        labels = ["generic"] * len(seeds)
+    seeds, labels = AsyncFuzzInspector.dedupe_bytes_with_labels(seeds, labels)
+
+    # Honor live-config flags (if present)
+    require_stable = bool(live_cfg.get("require_stable", True))
+    # Allow runtime promotion tuning via live cfg
+    if live_cfg.get("promote_heur") is True:
+        os.environ["FUZZ_PROMOTE_HEUR"] = "1"
+    if live_cfg.get("minimize") is False:
+        os.environ["FUZZ_MINIMIZE"] = "0"
+
+    # Dispatch commands
+    if args.cmd == "fuzz-spawn":
+        # Merge env overrides
+        env_overrides = parse_env_kv(args.env or [])
+        # Update argv pre/post from args already set above
+        # Optionally set file template (already applied)
+        max_conc = max(1, int(getattr(args, "max_concurrency", 1)))
         await af.fuzz_spawn(
-            target_path=args.target, surface=args.surface, timeout=args.timeout,
-            arg_index=args.arg_index, file_arg_index=args.file_arg_index,
-            env_overrides=env_overrides, seeds=seeds, max_iters=args.iters
+            target_path=args.target,
+            surface=args.surface,
+            base_timeout=base_timeout,
+            arg_index=args.arg_index,
+            file_arg_index=args.file_arg_index,
+            env_overrides=env_overrides,
+            seeds=seeds,
+            max_iters=int(args.iters),
+            max_concurrency=max_conc,
+            require_stable=require_stable,
         )
         return
 
     if args.cmd == "fuzz-pid":
+        # Apply avoid-hex to environment so _mutate_pid can read it
         if args.avoid_hex:
             os.environ["FUZZ_PID_AVOID_HEX"] = args.avoid_hex
-        env_overrides = parse_env_kv(args.env)
-        seeds: List[bytes] = [b"A"]; labels: List[str] = ["generic"]
-        if args.seeds:
-            seeds, labels = AsyncFuzzInspector.load_seeds_any(args.seeds)
-            seeds, labels = AsyncFuzzInspector.dedupe_bytes_with_labels(seeds, labels)
+
+        # Profile hints (already loaded into 'prof'); autoconfig transport from labels if asked
         if args.autoconfig:
             AsyncFuzzInspector.maybe_autoconfig_transport_from_labels(labels)
+
+        env_overrides = parse_env_kv(args.env or [])
         await af.fuzz_pid(
-            pid=args.pid, target_path_for_repro=args.target_for_repro, surface=args.surface, timeout=args.timeout,
-            arg_index=args.arg_index, file_arg_index=args.file_arg_index, env_overrides=env_overrides,
-            seeds=seeds, labels=labels, max_iters=args.iters
+            pid=int(args.pid),
+            target_path_for_repro=args.target_for_repro,
+            surface=args.surface,
+            base_timeout=base_timeout,
+            arg_index=args.arg_index,
+            file_arg_index=args.file_arg_index,
+            env_overrides=env_overrides,
+            seeds=seeds,
+            labels=labels,
+            max_iters=int(args.iters),
+            require_stable=require_stable,
         )
         return
 
     if args.cmd == "iat":
-        base = args.base_name or f"iat_{args.pid}_{AsyncFuzzInspector.now_stamp()}"
-        insp = AsyncFuzzInspector.ProcessImportsInspector(args.pid)
+        pid = int(args.pid)
+        base_name = args.base_name or f"iat_{pid}_{AsyncFuzzInspector.now_stamp()}"
+        insp = AsyncFuzzInspector.ProcessImportsInspector(pid)
         try:
             entries = insp.enumerate_imports_main_only()
         finally:
             insp.close()
-        filtered = AsyncFuzzInspector.filter_entries(entries, args.dll_rgx, args.func_rgx, args.only_ordinal)
-        AsyncFuzzInspector.print_preview(filtered, limit=args.preview)
-        paths = AsyncFuzzInspector.write_artifacts(base, filtered)
-        print("[iat] artifacts:", json.dumps(paths, indent=2))
+
+        entries = AsyncFuzzInspector.filter_entries(
+            entries,
+            dll_rgx=args.dll_rgx,
+            func_rgx=args.func_rgx,
+            only_ordinal=bool(args.only_ordinal),
+        )
+        out_paths = AsyncFuzzInspector.write_artifacts(base_name, entries)
+        AsyncFuzzInspector.print_preview(entries, limit=int(args.preview))
+        print(f"[iat] wrote: {out_paths['json']} and {out_paths['csv']}")
         return
 
     if args.cmd == "exe-of-pid":
-        path = AsyncFuzzInspector.get_exe_path_from_pid(args.pid)
-        print(path)
+        pid = int(args.pid)
+        try:
+            path = AsyncFuzzInspector.get_exe_path_from_pid(pid)
+            print(path)
+        except Exception as e:
+            print(f"[exe-of-pid] error: {e}")
         return
 
-def main():
+
+def main() -> None:
     try:
         asyncio.run(main_async(sys.argv[1:]))
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")
+
 
 if __name__ == "__main__":
     main()
