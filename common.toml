@@ -1,0 +1,75 @@
+# Full-featured config for Async Fuzz + IAT Inspector
+# Layered & hot-reload friendly. You can chain includes as needed.
+# Example: keep hardened defaults in configs/common.toml then override here.
+include = ["configs/common.toml"]
+
+# ---- Global knobs ----
+timeout = 3.0                      # Base seconds for AdaptiveTimeout (↑/↓ hotkeys still adjust)
+require_stable = true              # Re-check crash once before calling "probable"
+promote_heur = true                # Allow heuristic spikes to promote
+minimize = true                    # Run async minimizer on crash
+minimize_budget_ms = 2000          # ms budget for on-crash shrinking
+
+# Broad crash/asan/ubsan/tsan/glibc/Windows signals (case-insensitive)
+stderr_add_pat = 'use-after-free|heap-use-after-free|stack-use-after-return|use-after-scope|double free|invalid free|corrupted double[- ]?linked list|glibc detected|munmap_chunk\(\): invalid pointer|free\(\): invalid pointer|realloc\(\): invalid pointer|heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow|out[- ]?of[- ]?bounds|index out of bounds|buffer overflow detected|stack smashing detected|stack[- ]?buffer[- ]?overrun|heap corruption|HEAP CORRUPTION DETECTED|RtlReportCriticalFailure|_security_check_cookie|gsfailure|__fastfail|STATUS_STACK_BUFFER_OVERRUN|STATUS_HEAP_CORRUPTION|0xC0000005|C0000409|C00000FD|C0000374|0xC0000[0-9A-Fa-f]{3}|access violation|segmentation fault|segfault|Unhandled exception|invalid parameter|abort\(\)|terminate called after throwing|std::terminate|std::bad_alloc|Assertion.*failed|fatal signal \d+|AddressSanitizer|UndefinedBehaviorSanitizer|ThreadSanitizer|MemorySanitizer|asan|ubsan|tsan|msan|null pointer dereference|integer overflow|shift exponent|division by zero|load of misaligned address|EXC_BAD_ACCESS|panic occurred|fatal runtime error|RUST_BACKTRACE|WER_CRASH_DUMP_DETECTED'
+
+# Classifier defaults
+any_c000_as_crash = true
+treat_warn_as_crash = false
+include_rc_hints = true
+timeout_is_crash = true
+
+# Files for "file" surface (choose one default + provide alternates)
+file_template = "json"             # default wrapper; can be: png|zip|json|xml|bmp|wav|gif|jpg|jpeg|pdf|tar|7z
+file_templates = ["json", "png", "pdf", "zip", "jpeg", "zip", "xml", "bmp", "wav", "gif", "jpg", "tar", "7z"]
+
+# Smart argv shaping
+argv_pre  = ["-sS"]
+argv_post = ["--path-as-is"]
+
+# Token harvest hints (augment mutation dictionary)
+headers  = ["Authorization","Content-Type","Accept","Cookie","Range","If-Modified-Since","Referer","Accept-Encoding"]
+flags    = ["--header","--data","--config","-v","--insecure","--path-as-is","--limit-rate","--proxy","--url","--output"]
+env_keys = ["HTTP_PROXY","HTTPS_PROXY","NO_PROXY","SSL_CERT_FILE","APP_MODE"]
+
+# Exit-code tuning (plain rc, not NTSTATUS). Noise reducers for common CLIs.
+ignore_rcs = [2,3,22,26,64]        # ignore these plain exit codes
+warn_rcs   = [7,42]                # keep as hint without promoting
+
+# Default surface when user leaves --surface=auto
+default_surface = "stdin"
+
+# ---- PID delivery defaults (flip pid_mode as needed) ----
+pid_mode = "file"                  # file|file+notify|tcp|pipe|wmcopydata|noop
+pid_tcp_addr = "${ENV:FUZZ_TCP_ADDR|127.0.0.1}"
+pid_tcp_port = 9001
+pid_pipe_name = '\\.\pipe\FuzzIn'  # single-quoted (no escaping); change per target
+pid_drop_dir = "artifacts/deliveries"
+pid_monitor_log = ""               # e.g., "C:/temp/target_stderr.log" to scrape signals
+pid_avoid_hex = "00,0a,0d"         # avoid NUL, LF, CR for fragile protocols
+pid_tcp_append_nl = false
+
+# ---- Per-mode convenience blocks (available for your own tooling) ----
+[spawn]
+max_concurrency = 4
+iters = 512
+default_surface = "stdin"
+
+[pid]
+iters = 256
+default_surface = "auto"
+
+# ---- Optional per-target hints (your tooling can use these to pre-seed dictionaries) ----
+# NOTE: Provided for organization; the core integration you've pasted doesn't auto-apply these.
+# You may use them in a thin wrapper to adjust flags/headers/ignore_rcs by executable name.
+[[targets]]
+match = "curl.exe"
+flags = ["--http0.9","--path-as-is","--raw"]
+ignore_rcs = [3,26]                # curl: URL malformed/failed transfer
+headers = ["Expect","Transfer-Encoding","Trailer","TE"]
+
+[[targets]]
+match = "ffmpeg.exe"
+flags = ["-f","-i","-y","-loglevel","-hide_banner"]
+ignore_rcs = [1]                   # ffmpeg returns 1 on many parse errors
+headers = []
