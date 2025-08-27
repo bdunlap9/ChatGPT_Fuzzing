@@ -37,6 +37,170 @@ def parse_env_kv(pairs: List[str]) -> Dict[str, str]:
         env[k] = v
     return env
 
+
+# -------------------- Classifier (module scope) --------------------
+class OverflowClassifier:
+    """
+    Strong/weak crash classification designed to reduce repro spam:
+
+    - Strong crash only when:
+      * Stderr matches hardened crash patterns (ASan/UCRT/GS cookie/etc), or
+      * Return code is an NTSTATUS in CRASH_STATUS_SET, or any 0xC000**** (unless ignored),
+      * A POSIX signal-style negative rc (e.g. -11) is present,
+      * WER marker appended ("WER_CRASH_DUMP_DETECTED").
+
+    - Weak hints (non-zero rc, stderr spikes, warnings) are recorded in `inds` but do not flip `crashed=True`.
+
+    Env knobs (all optional):
+      FUZZ_ANY_C000_AS_CRASH=1   -> treat any 0xC000**** (except IGNORE_STATUS_SET) as crash (default: 1)
+      FUZZ_TREAT_WARN_AS_CRASH=0 -> treat 0x8000**** as crash (default: 0 = off)
+      FUZZ_INCLUDE_RC_HINTS=0    -> include plain "rc:X" hint in inds (default: 0 = off)
+      FUZZ_TIMEOUT_IS_CRASH=0    -> count timeouts as crash (default: 0 = off)
+      FUZZ_STDERR_ADD_PAT        -> extra patterns, '|' separated (regex OR)
+    """
+
+    # Strongly-fatal NTSTATUS codes that almost always indicate a real crash
+    CRASH_STATUS_SET = {
+        0xC0000005,  # STATUS_ACCESS_VIOLATION
+        0xC0000409,  # STATUS_STACK_BUFFER_OVERRUN / FAST_FAIL
+        0xC0000374,  # STATUS_HEAP_CORRUPTION
+        0xC000001D,  # STATUS_ILLEGAL_INSTRUCTION
+        0xC00000FD,  # STATUS_STACK_OVERFLOW
+        0xC000008C,  # STATUS_ARRAY_BOUNDS_EXCEEDED
+        0xC0000094,  # STATUS_INTEGER_DIVIDE_BY_ZERO
+        0xC0000095,  # STATUS_INTEGER_OVERFLOW
+        0xC0000096,  # STATUS_PRIVILEGED_INSTRUCTION
+        0xC0000006,  # STATUS_IN_PAGE_ERROR (page-in AV)
+        0xC0000025,  # STATUS_NONCONTINUABLE_EXCEPTION
+        0xC0000028,  # STATUS_INVALID_DISPOSITION (bad SEH)
+        0xC000008E,  # STATUS_FLOAT_DIVIDE_BY_ZERO
+        0xC0000090,  # STATUS_FLOAT_INVALID_OPERATION
+        0xC0000091,  # STATUS_FLOAT_OVERFLOW
+        0xC0000092,  # STATUS_FLOAT_STACK_CHECK
+        0xC0000093,  # STATUS_FLOAT_UNDERFLOW
+        0xC00002B4,  # STATUS_FLOAT_MULTIPLE_FAULTS
+        0xC00002B5,  # STATUS_FLOAT_MULTIPLE_TRAPS
+    }
+
+    # Often-crashy but technically severity=warning (high bit 0x8000...). Treat as crash only if configured.
+    WARN_STATUS_SET = {
+        0x80000001,  # STATUS_GUARD_PAGE_VIOLATION
+        0x80000002,  # STATUS_DATATYPE_MISALIGNMENT
+        0x80000003,  # STATUS_BREAKPOINT
+        0x80000004,  # STATUS_SINGLE_STEP
+    }
+
+    # Things to ignore (common non-bugs)
+    IGNORE_STATUS_SET = {
+        0xC000013A,  # STATUS_CONTROL_C_EXIT (Ctrl+C / external terminate)
+    }
+
+    # High-signal stderr patterns (Windows + sanitizers)
+    OVERFLOW_STDERR_PATTERNS = [
+        r"stack smashing detected",
+        r"buffer overflow detected",
+        r"addresssanitizer|asan",              # ASan
+        r"ubsan|undefined behavior",           # UBSan
+        r"msan|tsan",                          # MSan/TSan
+        r"stack[- ]?buffer[- ]?overrun",       # MSVC wording
+        r"_security_check_cookie|stack cookie|__report_gsfailure|gsfailure",
+        r"heap corruption|HEAP CORRUPTION DETECTED",
+        r"RtlReportCriticalFailure",
+        r"invalid parameter",                  # UCRT invalid parameter handler
+        r"abort\(\)",                          # generic termination
+        r"access violation|segmentation fault|segfault",
+        r"Unhandled exception",
+        r"0xC0000[0-9A-Fa-f]{3}",              # explicit exception code mentions
+        r"WER_CRASH_DUMP_DETECTED",
+    ]
+    _pat = re.compile("|".join(f"(?:{p})" for p in OVERFLOW_STDERR_PATTERNS), re.IGNORECASE)
+
+    @staticmethod
+    def _posix_signal(rc: Optional[int]) -> Optional[int]:
+        # rc < 0 often encodes a POSIX signal number (e.g. -11 => SIGSEGV)
+        if rc is not None and rc < 0:
+            return -rc
+        return None
+
+    @staticmethod
+    def _win_status(rc: Optional[int]) -> Optional[int]:
+        if rc is None:
+            return None
+        return rc & 0xFFFFFFFF
+
+    def __init__(self):
+        # read env once
+        self.any_c000_as_crash = os.environ.get("FUZZ_ANY_C000_AS_CRASH", "1") == "1"
+        self.warn_as_crash     = os.environ.get("FUZZ_TREAT_WARN_AS_CRASH", "0") == "1"
+        self.include_rc_hints  = os.environ.get("FUZZ_INCLUDE_RC_HINTS", "0") == "1"
+        self.timeout_is_crash  = os.environ.get("FUZZ_TIMEOUT_IS_CRASH", "0") == "1"
+
+        extra = os.environ.get("FUZZ_STDERR_ADD_PAT", "").strip()
+        if extra:
+            self._pat = re.compile(self._pat.pattern + "|" + extra, re.IGNORECASE)
+
+        # light caches
+        self._crash_set  = OverflowClassifier.CRASH_STATUS_SET
+        self._warn_set   = OverflowClassifier.WARN_STATUS_SET
+        self._ignore_set = OverflowClassifier.IGNORE_STATUS_SET
+
+        # POSIX crashy signals (if rc is -signal)
+        self._posix_severe = {11, 6, 4, 8, 5, 7}  # SEGV, ABRT, ILL, FPE, TRAP, BUS
+
+    def classify(self, rc: Optional[int], stderr: bytes) -> Tuple[bool, List[str]]:
+        inds: List[str] = []
+        strong = False
+
+        se_bytes = stderr or b""
+        se_text  = se_bytes.decode("utf-8", errors="ignore")
+
+        # --- Strong textual signals ---
+        if self._pat.search(se_text):
+            inds.append("stderr:crashy")
+            strong = True
+        if b"WER_CRASH_DUMP_DETECTED" in se_bytes:
+            inds.append("wer:dump")
+            strong = True
+
+        # --- Return code analysis ---
+        win = self._win_status(rc)
+        sig = self._posix_signal(rc)
+
+        if rc is None:
+            inds.append("timeout")
+            if self.timeout_is_crash:
+                strong = True
+
+        # POSIX signal mapping
+        if sig in self._posix_severe:
+            inds.append(f"posix:signal:{sig}")
+            strong = True
+
+        if win is not None:
+            # Ignore clean external kill / Ctrl+C
+            if win in self._ignore_set:
+                inds.append(f"win:ignored:0x{win:08X}")
+            else:
+                # Treat known fatal statuses as strong
+                if win in self._crash_set:
+                    inds.append(f"win:0x{win:08X}")
+                    strong = True
+                # Optionally treat any 0xC000**** as strong (except ignored)
+                elif self.any_c000_as_crash and (win & 0xC0000000) == 0xC0000000:
+                    inds.append(f"win:c000+:{win:08X}")
+                    strong = True
+                # Optionally treat 0x8000**** as crash (guard page, misalignment, etc.)
+                elif self.warn_as_crash and (win & 0x80000000) == 0x80000000:
+                    inds.append(f"win:warn:0x{win:08X}")
+                    strong = True
+                else:
+                    # Keep as hint only (don’t flip to crash)
+                    if self.include_rc_hints:
+                        inds.append(f"rc:{rc}")
+
+        return strong, inds
+
+
 # -------------------- Unified Async Class --------------------
 class AsyncFuzzInspector:
     # ---- Win32 constants ----
@@ -58,8 +222,8 @@ class AsyncFuzzInspector:
         self.file_template = os.environ.get("FUZZ_FILE_TEMPLATE", None)
 
         # Heuristics / novelty / buckets / tokens / WER
-        self.classifier = self.OverflowClassifier()
-        self.crash_buckets = self.CrashBucketer()
+        self.classifier = OverflowClassifier()
+        self.crash_buckets = AsyncFuzzInspector.CrashBucketer()
         self.novelty = self.NoveltyMap()
         self.hsig = self.HeuristicSignals()
         self.tokens: List[bytes] = []
@@ -531,49 +695,7 @@ class AsyncFuzzInspector:
                 await asyncio.sleep(0)
         return best
 
-    # ---------------- Classifier & Heuristics ----------------
-    class OverflowClassifier:
-        OVERFLOW_STDERR_PATTERNS = [
-            r"stack smashing detected",
-            r"buffer overflow detected",
-            r"addresssanitizer",
-            r"stack-buffer-overflow",
-            r"heap-buffer-overflow",
-            r"__fortify_fail",
-            r"_security_check_cookie",
-            r"stack cookie",
-            r"WER_CRASH_DUMP_DETECTED",
-        ]
-        _pat = re.compile("|".join(f"(?:{p})" for p in OVERFLOW_STDERR_PATTERNS), re.IGNORECASE)
-
-        @staticmethod
-        def _posix_signal(rc: Optional[int]) -> Optional[int]:
-            if rc is not None and rc < 0:
-                return -rc
-            return None
-
-        @staticmethod
-        def _win_status(rc: Optional[int]) -> Optional[int]:
-            if rc is None:
-                return None
-            return rc & 0xFFFFFFFF
-
-        def classify(self, rc: Optional[int], stderr: bytes) -> Tuple[bool, List[str]]:
-            inds = []
-            se = (stderr or b"").lower()
-            if (b"fast_fail" in se or b"stack buffer overrun" in se or b"gsfailure" in se
-                or b"__report_gsfailure" in se or b"c0000409" in se):
-                inds.append("win:fast_fail_stack_cookie")
-            if b"c0000005" in se or b"access violation" in se:
-                inds.append("win:access_violation")
-            if b"invalid parameter" in se or b"abort()" in se or b"ucrtbase" in se:
-                inds.append("ucrt:invalid_param")
-            if rc is None:
-                inds.append("timeout")
-            elif isinstance(rc, int) and rc != 0:
-                inds.append(f"rc:{rc}")
-            return (len(inds) > 0), inds
-
+    # ---------------- Heuristics / Novelty / Buckets / Artifacts ----------------
     class HeuristicSignals:
         def __init__(self):
             self.lat_ms = []
@@ -1433,55 +1555,156 @@ class AsyncFuzzInspector:
                     print("[crash] duplicate bucket; skipping repro bundle")
                     continue
 
+                # ----- Minimization (optional) -----
                 do_min = os.environ.get("FUZZ_MINIMIZE", "1") == "1"
                 min_ms = int(os.environ.get("FUZZ_MINIMIZE_BUDGET_MS", "1200"))
                 if do_min:
                     async def pred(b: bytes) -> bool:
-                        tmin0 = time.perf_counter()
+                        t0 = time.perf_counter()
                         await self._deliver_to_pid(payload=b, timeout=timeout)
                         rc2, se2 = await self._collect_signals(timeout=timeout)
-                        _dt = (time.perf_counter() - tmin0) * 1000.0
+                        dt2 = (time.perf_counter() - t0) * 1000.0
+                        # Strong signals win
                         ok2, _ = self.classifier.classify(rc2, se2)
-                        if ok2: return True
+                        if ok2:
+                            return True
+                        # Optional heuristic promotion
                         if os.environ.get("FUZZ_PROMOTE_HEUR", "0") == "1":
                             hs_tmp = self.HeuristicSignals()
                             hs_tmp.lat_ms = list(self.hsig.lat_ms)
                             hs_tmp.stderr_lens = list(self.hsig.stderr_lens)
                             hs_tmp.rc_hist = dict(self.hsig.rc_hist)
-                            suspicious2, _r, _s = hs_tmp.update_and_score(dt_ms=_dt, stderr_len=len(se2 or b""), rc=rc2)
+                            suspicious2, _r, _s = hs_tmp.update_and_score(
+                                dt_ms=dt2, stderr_len=len(se2 or b""), rc=rc2
+                            )
                             return suspicious2
                         return False
+
                     payload_min = await self.minimize_payload_async(payload, pred, time_budget_ms=min_ms)
                     if len(payload_min) < len(payload):
                         print(f"[min] shrank payload {len(payload)} -> {len(payload_min)} bytes")
                         payload = payload_min
 
+                # ----- Save artifacts & meta -----
                 saved = corpus.save(payload, tag="crash")
                 if saved:
                     print(f"[crash] saved payload -> {saved}")
                     try:
                         meta = {
-                            "pid": pid, "target_for_repro": target_path_for_repro, "surface": surface,
-                            "rc": rc, "dt_ms": dt_ms, "indicators": indicators,
-                            "arg_index": arg_index, "file_arg_index": file_arg_index,
-                            "pre_args": self.pre_args, "post_args": self.post_args,
+                            "mode": (os.environ.get("FUZZ_PID_MODE", "noop") or "noop"),
+                            "pid": pid,
+                            "target_for_repro": target_path_for_repro,
+                            "rc": rc,
+                            "dt_ms": dt_ms,
+                            "indicators": indicators,
                             "ts": self.now_stamp(),
+                            "tcp_addr": os.environ.get("FUZZ_PID_TCP_ADDR", "127.0.0.1"),
+                            "tcp_port": int(os.environ.get("FUZZ_PID_TCP_PORT", "0") or "0"),
+                            "pipe_name": os.environ.get("FUZZ_PID_PIPE_NAME", ""),
+                            "drop_dir": os.environ.get("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries")),
                         }
                         with open(saved + ".json", "w", encoding="utf-8") as mf:
                             json.dump(meta, mf, indent=2)
                     except Exception:
                         pass
 
-                chosen_surface, arg_idx, file_idx = self._choose_surface_for_payload(surface, payload, arg_index, file_arg_index)
-                print("\n=== PROBABLE VULN (pid) ===")
-                print("Indicators:", ", ".join(indicators))
-                paths = repro.build_and_optionally_run(
-                    target_path=target_path_for_repro, surface=chosen_surface, payload=payload, timeout=timeout,
-                    arg_index=arg_idx, env_overrides=env_overrides, file_arg_index=file_idx, run_after_write=True
-                )
-                print("[fuzz-pid] Repro bundle:", json.dumps(paths, indent=2))
+                    # ----- Build a runnable "deliver" script that replays the same PID transport -----
+                    def _build_pid_repro(payload_path: str) -> str:
+                        mode = (os.environ.get("FUZZ_PID_MODE", "noop") or "noop").strip().lower()
+                        drop_dir = (os.environ.get("FUZZ_PID_DROP_DIR", os.path.join("artifacts", "deliveries")) or "").strip()
+                        tcp_addr = (os.environ.get("FUZZ_PID_TCP_ADDR", "127.0.0.1") or "127.0.0.1").strip()
+                        tcp_port = int((os.environ.get("FUZZ_PID_TCP_PORT", "0") or "0").strip() or "0")
+                        pipe_name = (os.environ.get("FUZZ_PID_PIPE_NAME", "") or "").strip()
+                        append_nl = os.environ.get("FUZZ_PID_TCP_APPEND_NL", "0") == "1"
+
+                        script = f"""#!/usr/bin/env python3
+import os, sys, time, socket
+mode={mode!r}
+payload_path={os.path.abspath(payload_path)!r}
+drop_dir={drop_dir!r}
+tcp_addr={tcp_addr!r}
+tcp_port={tcp_port}
+pipe_name={pipe_name!r}
+append_nl={str(append_nl)}
+
+def main():
+    with open(payload_path, "rb") as f:
+        data = f.read()
+
+    if mode == "file":
+        os.makedirs(drop_dir, exist_ok=True)
+        stamp = str(int(time.time()*1e6))
+        out_path = os.path.join(drop_dir, "payload_" + stamp + ".bin")
+        with open(out_path, "wb") as w:
+            w.write(data)
+        with open(out_path + ".meta.json", "w", encoding="utf-8") as mf:
+            mf.write('{{"bytes":%d,"timestamp":"%s"}}' % (len(data), stamp))
+        print("[repro-pid] wrote", out_path)
+        return
+
+    if mode == "tcp":
+        if not tcp_port:
+            print("[repro-pid] tcp port not set"); sys.exit(2)
+        with socket.create_connection((tcp_addr, tcp_port), timeout=5.0) as s:
+            s.sendall(data)
+            if append_nl:
+                s.sendall(b"\\n")
+        print(f"[repro-pid] sent {{len(data)}} bytes to {{tcp_addr}}:{{tcp_port}}")
+        return
+
+    if mode == "pipe":
+        import ctypes as C, ctypes.wintypes as W
+        kernel32 = C.WinDLL("kernel32", use_last_error=True)
+        CreateFileW = kernel32.CreateFileW
+        CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD, W.HANDLE]
+        CreateFileW.restype  = W.HANDLE
+        WriteFile = kernel32.WriteFile
+        WriteFile.argtypes = [W.HANDLE, W.LPCVOID, W.DWORD, C.POINTER(W.DWORD), W.LPVOID]
+        WriteFile.restype  = W.BOOL
+
+        if not pipe_name:
+            print("[repro-pid] pipe name not set"); sys.exit(2)
+
+        h = CreateFileW(pipe_name, 0x40000000, 0, None, 3, 0, None)  # GENERIC_WRITE, OPEN_EXISTING
+        if int(h) == 0 or int(h) == C.c_void_p(-1).value:
+            raise OSError(f"CreateFileW failed on {{pipe_name}} (WinErr={{C.get_last_error()}})")
+        try:
+            n = W.DWORD(0)
+            ok = WriteFile(h, data, len(data), C.byref(n), None)
+            if not ok or n.value != len(data):
+                raise OSError(f"WriteFile to pipe incomplete: {{n.value}}/{{len(data)}} (WinErr={{C.get_last_error()}})")
+        finally:
+            kernel32.CloseHandle(h)
+        print(f"[repro-pid] wrote {{len(data)}} bytes to {{pipe_name}}")
+        return
+
+    print(f"[repro-pid] noop: would deliver {{len(data)}} bytes")
+
+if __name__ == "__main__":
+    main()
+"""
+                        out_dir = "crashes"
+                        self.ensure_outdir(out_dir)
+                        out_path = os.path.join(out_dir, f"deliver_{self.now_stamp()}.py")
+                        with open(out_path, "w", encoding="utf-8") as f:
+                            f.write(script)
+                        try:
+                            os.chmod(out_path, 0o755)
+                        except Exception:
+                            pass
+                        return out_path
+
+                    repro_py = _build_pid_repro(saved)
+
+                    print("\n=== PROBABLE VULN (pid) ===")
+                    print("Indicators:", ", ".join(indicators))
+                    print("[fuzz-pid] Repro bundle:", json.dumps({
+                        "payload_bin": saved,
+                        "reproducer_py": repro_py
+                    }, indent=2))
 
         print("[fuzz-pid] Completed.")
+
 
 # ---------------- CLI ----------------
 def build_arg_parser() -> argparse.ArgumentParser:
