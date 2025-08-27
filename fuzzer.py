@@ -17,14 +17,249 @@ Windows-only for IAT/Win32 parts. Python 3.9+.
 """
 
 import argparse,asyncio,base64,csv,datetime,hashlib,json,os,random,re,socket,sys,textwrap,time,threading
-from pathlib import Path
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from threading import Event
 
 # Optional deps used in certain features
 try:
     import requests  # for profile loader (URL)
 except Exception:
     requests = None
+
+try:
+    import tomli
+except Exception:
+    tomli = None
+
+@dataclass
+class FuzzSchema:
+    # global knobs
+    timeout: float = 2.0
+    require_stable: bool = True
+    promote_heur: bool = False
+    minimize: bool = True
+    minimize_budget_ms: int = 1200
+    file_template: Optional[str] = None  # png|zip|json|xml|bmp|wav|gif|jpg|jpeg|pdf|tar|7z
+    argv_pre: List[str] = field(default_factory=list)
+    argv_post: List[str] = field(default_factory=list)
+
+    # classifier tuning
+    any_c000_as_crash: bool = True
+    treat_warn_as_crash: bool = False
+    include_rc_hints: bool = False
+    timeout_is_crash: bool = False
+    stderr_add_pat: str = ""     # regex OR
+
+    # per-target hints (used to enrich globals)
+    ignore_rcs: List[int] = field(default_factory=list)
+    warn_rcs: List[int] = field(default_factory=list)
+    flags: List[str] = field(default_factory=list)
+    headers: List[str] = field(default_factory=list)
+    env_keys: List[str] = field(default_factory=list)
+    file_templates: List[str] = field(default_factory=list)
+    default_surface: Optional[str] = None  # auto|argv|stdin|env|file
+
+    # PID transport defaults
+    pid_mode: str = "noop"  # noop|file|file+notify|tcp|pipe|wmcopydata
+    pid_tcp_addr: str = "127.0.0.1"
+    pid_tcp_port: int = 0
+    pid_pipe_name: str = ""
+    pid_drop_dir: str = os.path.join("artifacts", "deliveries")
+    pid_monitor_log: str = ""   # path for stderr scraping
+    pid_avoid_hex: str = ""     # "00,0a,0d"
+    pid_tcp_append_nl: bool = False
+
+    # optional per-mode/per-target blocks (you may use them later)
+    spawn: dict = field(default_factory=dict)
+    pid: dict = field(default_factory=dict)
+    targets: List[dict] = field(default_factory=list)  # [{"match":"curl.exe","flags":["--path-as-is"]}]
+
+ALLOW_KEYS = set(FuzzSchema().__dict__.keys()) | {"include"}
+
+def _read_config_file(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if path.lower().endswith((".toml", ".tml")):
+            if not tomli:
+                raise RuntimeError("tomli not installed for TOML files")
+            return tomli.loads(data.decode("utf-8", "ignore"))
+        # JSON with comments supported (// and /* */)
+        txt = re.sub(r"/\*.*?\*/|//[^\n]*", "", data.decode("utf-8", "ignore"), flags=re.S)
+        return json.loads(txt or "{}")
+    except Exception as e:
+        print(f"[config] failed to parse {path}: {e}")
+        return {}
+
+def _expand_env_strings(obj):
+    # ${ENV:NAME|default}
+    if isinstance(obj, str):
+        def repl(m):
+            name = m.group(1); default = m.group(2) or ""
+            return os.environ.get(name, default)
+        return re.sub(r"\$\{ENV:([A-Z0-9_]+)\|?([^}]*)\}", repl, obj)
+    if isinstance(obj, list):
+        return [_expand_env_strings(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _expand_env_strings(v) for k, v in obj.items()}
+    return obj
+
+def _merge(a: dict, b: dict) -> dict:
+    # scalars replace; lists append-unique; dicts recurse
+    out = dict(a)
+    for k, v in (b or {}).items():
+        if k not in out:
+            out[k] = v; continue
+        if isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _merge(out[k], v)
+        elif isinstance(out[k], list) and isinstance(v, list):
+            seen = set(out[k])
+            out[k].extend([x for x in v if x not in seen])
+        else:
+            out[k] = v
+    return out
+
+def _strip_unknown(d: dict) -> dict:
+    clean = {}
+    for k, v in d.items():
+        if k == "include" or k in ALLOW_KEYS:
+            clean[k] = v
+        else:
+            print(f"[config] warning: unknown key '{k}' (ignored)")
+    return clean
+
+class ConfigManager:
+    """
+    Layers (earliest -> latest):
+      defaults -> ~/.fuzzrc.toml -> fuzz.toml -> fuzz.json -> fuzz_config.json (live)
+      -> profile (URL/file) -> env_overrides (dict) -> cli_overrides (dict)
+    """
+    def __init__(self, live_path="fuzz_config.json", extra_paths=None):
+        self.live_path = live_path
+        self.paths = [os.path.expanduser("~/.fuzzrc.toml"),
+                      "fuzz.toml", "fuzz.json", live_path]
+        if extra_paths: self.paths.extend(x for x in extra_paths if x)
+        self._stop = Event()
+        self._hash = ""
+        self.effective: FuzzSchema = FuzzSchema()
+
+    def _load_includes(self, blob: dict, base_dir: str) -> dict:
+        incs = blob.get("include") or []
+        if isinstance(incs, str): incs = [incs]
+        merged = dict(blob)
+        for rel in incs:
+            p = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
+            merged = _merge(_read_config_file(p), merged)
+        return merged
+
+    def load_layers(self, profile: dict = None, env_overrides: dict = None, cli_overrides: dict = None) -> FuzzSchema:
+        acc: dict = asdict(FuzzSchema())
+        for p in self.paths:
+            d = _read_config_file(p)
+            if not d: continue
+            d = _expand_env_strings(d)
+            d = self._load_includes(d, os.path.dirname(os.path.abspath(p)))
+            d = _strip_unknown(d)
+            acc = _merge(acc, d)
+
+        if profile:
+            acc = _merge(acc, _strip_unknown(profile))
+        if env_overrides:
+            acc = _merge(acc, env_overrides)
+        if cli_overrides:
+            acc = _merge(acc, cli_overrides)
+
+        fc = FuzzSchema(**{k: acc.get(k, getattr(FuzzSchema, k, None)) for k in ALLOW_KEYS if k != "include"})
+        # sanity clamps
+        try:
+            if not (0.2 <= float(fc.timeout) <= 60.0):
+                print("[config] clamped timeout to 0.2..60"); fc.timeout = max(0.2, min(60.0, float(fc.timeout)))
+        except Exception:
+            fc.timeout = 2.0
+        if fc.file_template and fc.file_template not in ["png","zip","json","xml","bmp","wav","gif","jpg","jpeg","pdf","tar","7z"]:
+            print(f"[config] invalid file_template '{fc.file_template}', ignoring"); fc.file_template = None
+
+        self.effective = fc
+        return fc
+
+    def write_effective_snapshot(self, path=os.path.join("artifacts","effective_config.json")):
+        # runtime lookup is OK; method is called after class is defined
+        AsyncFuzzInspector.ensure_outdir(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(asdict(self.effective), f, indent=2)
+
+    def apply_to_runtime(self, af: "AsyncFuzzInspector"):
+        fc = self.effective
+        # env for existing plumbing
+        os.environ["FUZZ_MINIMIZE"] = "1" if fc.minimize else "0"
+        os.environ["FUZZ_MINIMIZE_BUDGET_MS"] = str(fc.minimize_budget_ms)
+        os.environ["FUZZ_TIMEOUT_BASE"] = str(fc.timeout)
+        os.environ["FUZZ_ANY_C000_AS_CRASH"] = "1" if fc.any_c000_as_crash else "0"
+        os.environ["FUZZ_TREAT_WARN_AS_CRASH"] = "1" if fc.treat_warn_as_crash else "0"
+        os.environ["FUZZ_INCLUDE_RC_HINTS"] = "1" if fc.include_rc_hints else "0"
+        os.environ["FUZZ_TIMEOUT_IS_CRASH"] = "1" if fc.timeout_is_crash else "0"
+        if fc.stderr_add_pat: os.environ["FUZZ_STDERR_ADD_PAT"] = fc.stderr_add_pat
+
+        if fc.file_template:
+            os.environ["FUZZ_FILE_TEMPLATE"] = fc.file_template
+            af.file_template = fc.file_template
+
+        os.environ["FUZZ_ARGV_PRE"]  = json.dumps(fc.argv_pre or [])
+        os.environ["FUZZ_ARGV_POST"] = json.dumps(fc.argv_post or [])
+        af.pre_args  = fc.argv_pre or []
+        af.post_args = fc.argv_post or []
+
+        # classifier rc overrides
+        af.classifier.set_target_overrides(ignore_rcs=set(fc.ignore_rcs), warn_rcs=set(fc.warn_rcs))
+
+        # enrich global dicts
+        for fl in fc.flags:
+            b = fl.encode() if isinstance(fl, str) else fl
+            if b not in _FLAGS_LIKE: _FLAGS_LIKE.append(b)
+        for hk in fc.headers:
+            b = hk.encode() if isinstance(hk, str) else hk
+            if b not in _HDR_KEYS: _HDR_KEYS.append(b)
+        for ek in fc.env_keys:
+            tok = f"{ek}=".encode()
+            if tok not in af.tokens: af.tokens.append(tok)
+
+        # PID defaults
+        if fc.pid_mode: os.environ["FUZZ_PID_MODE"] = fc.pid_mode
+        os.environ["FUZZ_PID_TCP_ADDR"]   = fc.pid_tcp_addr
+        os.environ["FUZZ_PID_TCP_PORT"]   = str(fc.pid_tcp_port)
+        os.environ["FUZZ_PID_PIPE_NAME"]  = fc.pid_pipe_name
+        os.environ["FUZZ_PID_DROP_DIR"]   = fc.pid_drop_dir
+        os.environ["FUZZ_PID_MONITOR_LOG"]= fc.pid_monitor_log
+        os.environ["FUZZ_PID_AVOID_HEX"]  = fc.pid_avoid_hex
+        os.environ["FUZZ_PID_TCP_APPEND_NL"] = "1" if fc.pid_tcp_append_nl else "0"
+
+    def _hash_live(self) -> str:
+        try:
+            with open(self.live_path, "rb") as f:
+                b = f.read()
+        except Exception:
+            b = b""
+        return hashlib.sha1(b).hexdigest()
+
+    def start_hot_reload(self, interval=0.2, profile=None, env_overrides=None, cli_overrides=None):
+        self._hash = self._hash_live()
+        def loop():
+            while not self._stop.is_set():
+                h = self._hash_live()
+                if h != self._hash:
+                    self._hash = h
+                    print("[cfg] live change detected -> reloading")
+                    self.load_layers(profile=profile, env_overrides=env_overrides, cli_overrides=cli_overrides)
+                    self.write_effective_snapshot()
+                time.sleep(interval)
+        t = threading.Thread(target=loop, daemon=True); t.start()
+        return t
+
+    def stop(self): self._stop.set()
 
 # -------------------- Live Config + Hotkeys --------------------
 
@@ -131,7 +366,6 @@ _FLAGS_LIKE  = [b"-v", b"-i", b"-k", b"--tlsv1.0", b"--tls-max", b"--limit-rate"
 _INT_EDGES   = [b"0", b"1", b"2", b"7", b"8", b"9", b"10", b"15", b"16", b"31", b"32", b"63", b"64", b"127", b"128", b"255", b"256", b"1024", b"4095", b"4096", b"8191", b"8192"]
 _HDR_KEYS    = [b"Host", b"User-Agent", b"Accept", b"Cookie", b"Range", b"If-Modified-Since", b"Referer", b"Accept-Encoding"]
 
-
 def parse_env_kv(pairs: List[str]) -> Dict[str, str]:
     env: Dict[str, str] = {}
     for p in pairs or []:
@@ -141,36 +375,27 @@ def parse_env_kv(pairs: List[str]) -> Dict[str, str]:
         env[k] = v
     return env
 
-
 def load_target_profile(src: str) -> dict:
     """
-    Load a target profile from URL or file. Example keys (all optional):
-      {
-        "ignore_rcs":[...],
-        "warn_rcs":[...],
-        "flags":["--foo","-X"],
-        "headers":["X-Thing"],
-        "env_keys":["FOO","BAR"],
-        "file_templates":["json","png"],
-        "default_surface":"stdin"
-      }
+    Load a target profile from URL or file (JSON or TOML).
+    Keys (optional):
+      ignore_rcs, warn_rcs, flags, headers, env_keys, file_templates, default_surface
     """
-    prof = {}
     try:
-        if re.match(r'^https?://', src, re.I):
+        if re.match(r"^https?://", src, re.I):
             if not requests:
                 raise RuntimeError("requests not available for URL profiles")
             r = requests.get(src, timeout=5)
             r.raise_for_status()
             prof = r.json()
         else:
-            with open(src, "r", encoding="utf-8") as f:
-                prof = json.load(f)
+            prof = _read_config_file(src)  # supports TOML & JSON (with //, /* */ comments)
+            if not isinstance(prof, dict):
+                prof = {}
+        return prof
     except Exception as e:
         print(f"[profile] failed to load {src}: {e}")
         return {}
-    return prof
-
 
 def probe_cli_help(target_path: str) -> dict:
     """
@@ -2022,15 +2247,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     return p
 
+def apply_layered_config(args, af: "AsyncFuzzInspector"):
+    """
+    Builds layered config from files + profile + CLI flags,
+    applies it to env/runtime, starts hot-reload, and returns
+    (cfg_obj, base_timeout, require_stable).
+    """
+    profile_blob = load_target_profile(getattr(args, "profile", "")) if getattr(args, "profile", None) else {}
+
+    # What the user typed on CLI should win over files
+    cli_over = {}
+    if getattr(args, "file_template", None): cli_over["file_template"] = args.file_template
+    if getattr(args, "promote_heur", False): cli_over["promote_heur"] = True
+    if getattr(args, "no_minimize", False):  cli_over["minimize"] = False
+    if getattr(args, "argv_pre", None) is not None:  cli_over["argv_pre"] = args.argv_pre
+    if getattr(args, "argv_post", None) is not None: cli_over["argv_post"] = args.argv_post
+
+    cfgm = ConfigManager(live_path="fuzz_config.json",
+                         extra_paths=[getattr(args, "profile", None)])
+    cfg  = cfgm.load_layers(profile=profile_blob,
+                            env_overrides={}, cli_overrides=cli_over)
+    cfgm.apply_to_runtime(af)
+    cfgm.write_effective_snapshot()
+    cfgm.start_hot_reload(profile=profile_blob,
+                          env_overrides={}, cli_overrides=cli_over)
+
+    base_timeout   = float(os.environ.get("FUZZ_TIMEOUT_BASE", cfg.timeout))
+    require_stable = bool(cfg.require_stable)
+    if cfg.promote_heur:
+        os.environ["FUZZ_PROMOTE_HEUR"] = "1"
+
+    # If profile suggested a default surface and user left "auto", honor it
+    if getattr(args, "surface", "auto") == "auto" and cfg.default_surface:
+        args.surface = cfg.default_surface
+
+    return cfg, base_timeout, require_stable
+
 
 async def main_async(argv: List[str]) -> None:
     args = build_arg_parser().parse_args(argv)
 
-    # Live config + hotkeys
+    # Live hotkeys (keep your P/H/M/Arrows) + layered config
     live_cfg = LiveConfig("fuzz_config.json")
     start_hotkeys_thread(live_cfg)
-
     af = AsyncFuzzInspector()
+
+    cfg, base_timeout, require_stable = apply_layered_config(args, af)
 
     # Common env toggles
     if getattr(args, "file_template", None):
@@ -2086,10 +2348,6 @@ async def main_async(argv: List[str]) -> None:
         for hk in h["headers"]:
             b = hk.encode()
             if b not in _HDR_KEYS: _HDR_KEYS.append(b)
-        for hk in h["headers"]:
-            b = hk.encode()
-            if b not in _HDR_KEYS:
-                _HDR_KEYS.append(b)
         for ev in h["envs"]:
             tok = f"{ev}=".encode()
             if tok not in af.tokens:
